@@ -1,16 +1,20 @@
 import { createServer } from 'node:http';
+import type { KeyObject } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import type { Pool } from 'pg';
+import { inventoryAction } from './inventory-api.ts';
+import type { InventoryOptions } from './inventory-api.ts';
 import { tenantTransaction } from './postgres.ts';
+import { admitQuota, decrementStock, InventoryError, lockStock, salePosition, saveOutcome, settleQuota } from './quota-cloud.ts';
 import {
-  ackBody, digest, isScope, jsonBytes, maxEventBytes, parseEvent, printableReceipt,
+  ackBody, decode, digest, isScope, isUuid, jsonBytes, maxEventBytes, parseEvent, printableReceipt,
   readBounded, sameScope, signVoucher,
 } from './protocol.ts';
-import type { Disposition, SaleEvent, Scope, SigningKey, Voucher } from './protocol.ts';
+import type { Conflict, SaleEvent, Scope, SigningKey, Voucher } from './protocol.ts';
 
 export interface Enrollment extends Scope { token: string }
 interface StoredVoucher { body: Buffer; key_id: string; signature: string }
-type Claim = { body: Buffer } | { conflict: Exclude<Disposition, 'COMMITTED'> };
+type Claim = { body: Buffer } | { conflict: Conflict } | { staged: true };
 type Delivery = { bytes: Buffer; digest: string; event: SaleEvent };
 
 interface CloudObservers {
@@ -25,7 +29,7 @@ function pgConflict(error: unknown): boolean {
     'constraint' in error && error.constraint === 'sales_terminal_sequence';
 }
 
-async function claimSale(pool: Pool, delivery: Delivery): Promise<Claim> {
+async function claimSale(pool: Pool, delivery: Delivery, custodyKeys: ReadonlyMap<string, KeyObject>): Promise<Claim> {
   const { event: e, digest: requestDigest } = delivery;
   const { tenantId, saleId, storeId, terminalId, generation, sequence } = e;
   return tenantTransaction(pool, tenantId, async db => {
@@ -47,12 +51,13 @@ async function claimSale(pool: Pool, delivery: Delivery): Promise<Claim> {
     await db.query('RELEASE SAVEPOINT claim_sale');
     if (!inserted) {
       // The insert may have waited for a transaction invisible to its original snapshot.
-      const { rows: [winner] } = await db.query<{ request_digest: string; body: Buffer }>(`
-        SELECT s.request_digest, o.body FROM omni.sales s JOIN omni.outcomes o USING (tenant_id, sale_id)
+      const { rows: [winner] } = await db.query<{ request_digest: string; body: Buffer | null }>(`
+        SELECT s.request_digest, o.body FROM omni.sales s LEFT JOIN omni.outcomes o USING (tenant_id, sale_id)
         WHERE s.tenant_id = $1 AND s.sale_id = $2
       `, [tenantId, saleId]);
       if (winner) {
-        return winner.request_digest === requestDigest ? { body: winner.body } : { conflict: 'SALE_ID_CONFLICT' };
+        if (winner.request_digest !== requestDigest) return { conflict: 'SALE_ID_CONFLICT' };
+        return winner.body ? { body: winner.body } : { staged: true };
       }
       const sequenceOwner = await db.query(`
         SELECT sale_id FROM omni.sales WHERE tenant_id = $1 AND terminal_id = $2
@@ -62,24 +67,23 @@ async function claimSale(pool: Pool, delivery: Delivery): Promise<Claim> {
       throw new Error('Missing committed claim');
     }
 
-    const stock = await db.query(`
-      UPDATE omni.stock SET on_hand = on_hand - 1
-      WHERE tenant_id = $1 AND store_id = $2 AND sku = $3 AND on_hand >= 1 RETURNING on_hand
-    `, [tenantId, storeId, e.line.sku]);
-    if (stock.rowCount !== 1) throw new Error('Stock unavailable');
+    const stock = { tenantId, storeId, sku: e.line.sku };
+    await lockStock(db, stock);
+    const position = await salePosition(db, stock);
+    if (e.version === 1 && position) throw new InventoryError('Quota is required for new sales at this position');
+    const ready = e.version === 2 && await admitQuota(db, e, position, delivery.bytes, custodyKeys);
     await db.query('INSERT INTO omni.receipts VALUES ($1,$2,$3,$4)',
       [tenantId, e.receiptId, saleId, printableReceipt(e)]);
     await db.query('INSERT INTO omni.sale_lines VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
       [tenantId, e.line.id, saleId, storeId, e.line.sku, e.line.label, e.line.quantity, e.line.unitMinor]);
-    await db.query('INSERT INTO omni.stock_movements VALUES ($1,$2,$3)', [tenantId, e.line.id, e.line.stockDelta]);
     await db.query('INSERT INTO omni.journals VALUES ($1,$2,$3,$4)', [tenantId, saleId, e.currency, e.totalMinor]);
     await db.query(`
       INSERT INTO omni.journal_lines VALUES ($1,$2,'Cash','DR',$3), ($1,$2,'Revenue','CR',$3)
     `, [tenantId, saleId, e.totalMinor]);
-    const ack = ackBody(e, requestDigest, 'COMMITTED');
-    const body = jsonBytes(ack);
-    await db.query('INSERT INTO omni.outcomes VALUES ($1,$2,$3,$4)', [tenantId, saleId, ack.ackId, body]);
-    return { body };
+    if (e.version === 2) return ready ? { body: await settleQuota(db, e, requestDigest) } : { staged: true };
+    await decrementStock(db, stock);
+    await db.query('INSERT INTO omni.stock_movements VALUES ($1,$2,$3)', [tenantId, e.line.id, e.line.stockDelta]);
+    return { body: await saveOutcome(db, e, requestDigest, 'COMMITTED') };
   });
 }
 
@@ -108,6 +112,7 @@ async function issueVoucher(pool: Pool, event: SaleEvent, body: Buffer, signer: 
 
 export function createCloud(
   pool: Pool, enrollments: readonly Enrollment[], signer: SigningKey, observers?: CloudObservers,
+  inventory: InventoryOptions = {},
 ) {
   const enrolled = new Map<string, Scope>();
   for (const { token, ...scope } of enrollments) {
@@ -116,18 +121,27 @@ export function createCloud(
     }
     enrolled.set(token, scope);
   }
+  const operators = new Map<string, string>();
+  for (const { token, tenantId } of inventory.operators ?? []) {
+    if (!isUuid(tenantId) || typeof token !== 'string' || !/^[A-Za-z0-9_-]{24,128}$/.test(token) ||
+        enrolled.has(token) || operators.has(token)) throw new Error('Invalid inventory operator enrollment');
+    operators.set(token, tenantId);
+  }
+  const custodyKeys = inventory.custodyKeys ?? new Map<string, KeyObject>();
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(signer.id) ||
       signer.key.type !== 'private' || signer.key.asymmetricKeyType !== 'ed25519') {
     throw new Error('Invalid signing key');
   }
   return createServer({ requestTimeout: 8000, headersTimeout: 5000 }, async (request, response) => {
-    if (request.method !== 'POST' || request.url !== '/v1/sales') {
+    const operatorRoute = request.url === '/v2/inventory';
+    if (request.method !== 'POST' || (!operatorRoute && request.url !== '/v1/sales')) {
       response.writeHead(404, { connection: 'close' }).end();
       return;
     }
     const token = /^Bearer ([A-Za-z0-9_-]{24,128})$/.exec(request.headers.authorization ?? '')?.[1];
     const scope = token && enrolled.get(token);
-    if (!scope) {
+    const operator = token && operators.get(token);
+    if (!(operatorRoute ? operator : scope)) {
       response.writeHead(401, { connection: 'close' }).end();
       return;
     }
@@ -139,13 +153,41 @@ export function createCloud(
       response.writeHead(413, { connection: 'close' }).end();
       return;
     }
+    let bytes: Buffer;
+    try {
+      bytes = await readBounded(request.iterator({ destroyOnReturn: false }), maxEventBytes);
+    } catch {
+      response.writeHead(400, { connection: 'close' }).end();
+      return;
+    }
+    if (operatorRoute && operator) {
+      let input: Record<string, unknown>;
+      try {
+        input = decode(bytes);
+      } catch {
+        response.writeHead(400).end();
+        return;
+      }
+      try {
+        const result = await inventoryAction(pool, operator, input, signer, custodyKeys);
+        response.writeHead(200, { 'content-type': 'application/json' }).end(jsonBytes(result));
+      } catch (error) {
+        const status = error instanceof InventoryError ? error.status :
+          (typeof error === 'object' && error && 'code' in error && error.code === '23505' ? 409 : 503);
+        response.writeHead(status).end();
+      }
+      return;
+    }
+    if (!scope) {
+      response.writeHead(401).end();
+      return;
+    }
     let delivery: Delivery;
     try {
-      const bytes = await readBounded(request.iterator({ destroyOnReturn: false }), maxEventBytes);
       const requestDigest = digest(bytes);
       delivery = { bytes, digest: requestDigest, event: parseEvent(bytes) };
     } catch {
-      response.writeHead(400, { connection: 'close' }).end();
+      response.writeHead(400).end();
       return;
     }
     if (!sameScope(delivery.event, scope)) {
@@ -156,7 +198,11 @@ export function createCloud(
     delivery.event = { ...delivery.event, ...scope };
     try {
       observers?.received?.(delivery);
-      const claim = await claimSale(pool, delivery);
+      const claim = await claimSale(pool, delivery, custodyKeys);
+      if ('staged' in claim) {
+        response.writeHead(202).end();
+        return;
+      }
       let voucher: Voucher;
       if ('conflict' in claim) {
         voucher = signVoucher(409, jsonBytes(ackBody(delivery.event, delivery.digest, claim.conflict)), signer);
@@ -173,7 +219,7 @@ export function createCloud(
       }
     } catch (error) {
       observers?.failed?.(error);
-      if (!response.destroyed) response.writeHead(503).end();
+      if (!response.destroyed) response.writeHead(error instanceof InventoryError ? error.status : 503).end();
     }
   });
 }

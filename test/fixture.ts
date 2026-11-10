@@ -61,17 +61,20 @@ export async function testDatabase() {
     created.push(names.database);
     const dbUrl = new URL(url);
     dbUrl.pathname = `/${names.database}`;
-    const migration = poolFor(migrationUrl.href);
-    try {
-      await migrate(migration, names.runtime);
-      await migrate(migration, names.runtime);
-    } finally {
-      await migration.end();
-    }
+    const upgrade = async () => {
+      const migration = poolFor(migrationUrl.href);
+      try {
+        await migrate(migration, names.runtime);
+      } finally {
+        await migration.end();
+      }
+    };
+    await upgrade();
+    await upgrade();
     const fixture = poolFor(dbUrl.href);
     const runtime = poolFor(runtimeUrl.href);
     return {
-      fixture, runtime,
+      fixture, runtime, upgrade,
       oneConnection: () => poolFor(runtimeUrl.href, 1),
       async close() {
         try {
@@ -185,9 +188,8 @@ export class TerminalChild {
   }
 }
 
-export async function scenario(t: TestContext, db: TestDatabase) {
-  const dir = await mkdtemp(join(tmpdir(), 'omnipoint-m1-'));
-  const path = join(dir, 'terminal.sqlite');
+export async function testResources(t: TestContext) {
+  const dir = await mkdtemp(join(tmpdir(), 'omnipoint-'));
   const children: TerminalChild[] = [];
   const servers: Server[] = [];
   t.after(async () => {
@@ -207,24 +209,32 @@ export async function scenario(t: TestContext, db: TestDatabase) {
       }
     }
   });
-  const enrollment = await seed(db);
-  const { token, ...scope } = enrollment;
-  const terminal = new Terminal(path);
-  try {
-    terminal.initialize(scope, devItem);
-  } finally {
-    terminal.close();
-  }
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const signer = { id: 'fixture-ed25519', key: privateKey };
   const publicPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
   return {
-    path, enrollment, scope, signer, publicKey, publicPem,
-    input: { requestId: randomUUID(), cashierId: enrollment.cashierId, sku: devItem.sku, cashMinor: 2000 },
-    child() {
-      const child = new TerminalChild(path);
-      children.push(child);
-      return child;
+    dir, signer, publicKey, publicPem,
+    register(enrollment: Enrollment) {
+      const { token, ...scope } = enrollment;
+      const path = join(dir, `${scope.terminalId}-${randomUUID()}.sqlite`);
+      const terminal = new Terminal(path);
+      try {
+        terminal.initialize(scope, devItem);
+      } finally {
+        terminal.close();
+      }
+      return {
+        path, enrollment, scope,
+        input: { requestId: randomUUID(), cashierId: scope.cashierId, sku: devItem.sku, cashMinor: 2000 },
+        child() {
+          const child = new TerminalChild(path);
+          children.push(child);
+          return child;
+        },
+        sync(url: string) {
+          return { action: 'sync', url, token, keyId: signer.id, publicPem };
+        },
+      };
     },
     async listen(server: Server) {
       servers.push(server);
@@ -232,10 +242,12 @@ export async function scenario(t: TestContext, db: TestDatabase) {
       await bounded(once(server, 'listening'), 'HTTP listen');
       return `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/sales`;
     },
-    sync(url: string) {
-      return { action: 'sync', url, token, keyId: signer.id, publicPem };
-    },
   };
+}
+
+export async function scenario(t: TestContext, db: TestDatabase) {
+  const resources = await testResources(t);
+  return { ...resources, ...resources.register(await seed(db)) };
 }
 
 export function local<T>(path: string, inspect: (db: DatabaseSync) => T): T {

@@ -13,8 +13,7 @@ export interface Scope {
   cashierId: string;
 }
 
-export interface SaleEvent extends Scope {
-  version: 1;
+interface SaleFacts extends Scope {
   saleId: string;
   receiptId: string;
   sequence: number;
@@ -26,9 +25,22 @@ export interface SaleEvent extends Scope {
   tender: { method: 'CASH'; cashMinor: number; changeMinor: 0 };
 }
 
-export type Disposition = 'COMMITTED' | 'SALE_ID_CONFLICT' | 'SEQUENCE_CONFLICT';
+export interface SignedEvidence { body: string; keyId: string; signature: string }
+export interface QuotaSpend {
+  positionId: string;
+  locationId: string;
+  grantId: string;
+  grantDigest: string;
+  sliceId: string;
+  custody?: SignedEvidence;
+}
+export type QuotaSale = SaleFacts & { version: 2; quota: QuotaSpend };
+export type SaleEvent = (SaleFacts & { version: 1 }) | QuotaSale;
+export type Conflict = 'SALE_ID_CONFLICT' | 'SEQUENCE_CONFLICT';
+export type FinalDisposition = 'COMMITTED' | 'BACKORDER';
+export type Disposition = FinalDisposition | Conflict;
 export interface Ack {
-  version: 1;
+  version: 1 | 2;
   ackId: string;
   tenantId: string;
   terminalId: string;
@@ -51,6 +63,15 @@ export interface SigningKey {
 
 export const jsonBytes = (value: unknown): Buffer => Buffer.from(JSON.stringify(value), 'utf8');
 export const digest = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
+export const isDigest = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+export function trustedEndpoint(value: string): URL {
+  const url = new URL(value);
+  if (url.protocol !== 'https:' &&
+      !(url.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname))) {
+    throw new Error('HTTPS required outside loopback development');
+  }
+  return url;
+}
 export const isUuid = (value: unknown): value is string =>
   typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value);
 export const isSku = (value: unknown): value is string =>
@@ -60,17 +81,29 @@ export const isMinor = (value: unknown): value is number =>
 export const isLabel = (value: unknown): value is string =>
   typeof value === 'string' && value.length > 0 && value.length <= 80 && !/[\x00-\x1f\x7f]/.test(value);
 
-function isCounter(value: unknown): value is number {
+export function isCounter(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 2_147_483_647;
 }
 
-function record(value: unknown): Record<string, unknown> {
+export function record(value: unknown): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('Expected object');
   return value as Record<string, unknown>;
 }
 
-function decode(bytes: Uint8Array): Record<string, unknown> {
+export function decode(bytes: Uint8Array): Record<string, unknown> {
   return record(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)));
+}
+
+export function isIsoDate(value: unknown): value is string {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+export function isSignedEvidence(value: unknown): value is SignedEvidence {
+  if (!value || typeof value !== 'object') return false;
+  const packet = value as Record<string, unknown>;
+  return typeof packet.body === 'string' && /^[A-Za-z0-9_-]{1,4096}$/.test(packet.body) &&
+    typeof packet.keyId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(packet.keyId) &&
+    typeof packet.signature === 'string' && /^[A-Za-z0-9_-]{86}$/.test(packet.signature);
 }
 
 export function isScope(scope: Record<string, unknown>): scope is Scope & Record<string, unknown> {
@@ -83,14 +116,21 @@ export function parseEvent(bytes: Uint8Array): SaleEvent {
   const e = decode(bytes);
   const line = record(e.line);
   const tender = record(e.tender);
-  if (!isScope(e) || e.version !== 1 || !isUuid(e.saleId) || !isUuid(e.receiptId) ||
-      !isCounter(e.sequence) || typeof e.occurredAt !== 'string' ||
-      new Date(e.occurredAt).toISOString() !== e.occurredAt ||
+  if (!isScope(e) || (e.version !== 1 && e.version !== 2) || !isUuid(e.saleId) || !isUuid(e.receiptId) ||
+      !isCounter(e.sequence) || !isIsoDate(e.occurredAt) ||
       e.currency !== currency || !isUuid(line.id) || !isSku(line.sku) || !isLabel(line.label) ||
       line.quantity !== 1 || line.stockDelta !== -1 || !isMinor(line.unitMinor) ||
       e.taxMinor !== 0 || e.totalMinor !== line.unitMinor ||
       tender.method !== 'CASH' || tender.cashMinor !== e.totalMinor || tender.changeMinor !== 0) {
     throw new Error('Invalid sale event');
+  }
+  if (e.version === 2) {
+    const quota = record(e.quota);
+    if (!isUuid(quota.positionId) || !isUuid(quota.locationId) || !isUuid(quota.grantId) ||
+        !isUuid(quota.sliceId) || !isDigest(quota.grantDigest) ||
+        (quota.custody !== undefined && !isSignedEvidence(quota.custody))) throw new Error('Invalid quota spend');
+  } else if (e.quota !== undefined) {
+    throw new Error('Quota spend requires v2');
   }
   return e as unknown as SaleEvent;
 }
@@ -113,7 +153,7 @@ export function printableReceipt(event: SaleEvent): string {
 
 export function ackBody(e: SaleEvent, requestDigest: string, disposition: Disposition): Ack {
   return {
-    version: 1, ackId: randomUUID(), tenantId: e.tenantId, terminalId: e.terminalId,
+    version: e.version, ackId: randomUUID(), tenantId: e.tenantId, terminalId: e.terminalId,
     generation: e.generation, sequence: e.sequence, saleId: e.saleId, requestDigest, disposition,
   };
 }
@@ -142,9 +182,10 @@ export function verifyVoucher(
     throw new Error('Invalid acknowledgment signature');
   }
   const ack = decode(bytes);
-  const validDisposition = (status === 200 && ack.disposition === 'COMMITTED') ||
+  const validDisposition = (status === 200 && (ack.disposition === 'COMMITTED' ||
+    (event.version === 2 && ack.disposition === 'BACKORDER'))) ||
     (status === 409 && (ack.disposition === 'SALE_ID_CONFLICT' || ack.disposition === 'SEQUENCE_CONFLICT'));
-  if (!validDisposition || ack.version !== 1 || !isUuid(ack.ackId) ||
+  if (!validDisposition || ack.version !== event.version || !isUuid(ack.ackId) ||
       ack.tenantId !== event.tenantId || ack.terminalId !== event.terminalId ||
       ack.generation !== event.generation || ack.sequence !== event.sequence ||
       ack.saleId !== event.saleId || ack.requestDigest !== requestDigest) {

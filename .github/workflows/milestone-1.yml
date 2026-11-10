@@ -1,4 +1,4 @@
-name: OmniPoint Milestone 1
+name: OmniPoint Milestones 1 and 2
 on: [push, pull_request]
 
 permissions:

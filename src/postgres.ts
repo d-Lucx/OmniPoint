@@ -43,10 +43,13 @@ export async function migrate(pool: Pool, runtimeRole: string): Promise<void> {
     await db.query('SELECT pg_advisory_xact_lock(71422101)');
     await db.query('CREATE SCHEMA IF NOT EXISTS omni');
     await db.query('CREATE TABLE IF NOT EXISTS omni.migrations (version integer PRIMARY KEY)');
-    const applied = await db.query('SELECT version FROM omni.migrations WHERE version = 1');
-    if (!applied.rowCount) {
-      await db.query(readFileSync(new URL('../migrations/001-cloud.sql', import.meta.url), 'utf8'));
-      await db.query('INSERT INTO omni.migrations VALUES (1)');
+    const files = ['001-cloud.sql', '002-cloud.sql'];
+    const { rows } = await db.query<{ version: number }>('SELECT version FROM omni.migrations');
+    for (const [index, file] of files.entries()) {
+      const version = index + 1;
+      if (rows.some(row => row.version === version)) continue;
+      await db.query(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'));
+      await db.query('INSERT INTO omni.migrations VALUES ($1)', [version]);
     }
     await db.query(`
       GRANT USAGE ON SCHEMA omni TO ${role};
@@ -54,6 +57,12 @@ export async function migrate(pool: Pool, runtimeRole: string): Promise<void> {
       GRANT UPDATE (on_hand) ON omni.stock TO ${role};
       GRANT SELECT, INSERT ON omni.sales, omni.receipts, omni.sale_lines, omni.stock_movements,
         omni.journals, omni.journal_lines, omni.outcomes, omni.vouchers TO ${role};
+    `);
+    await db.query(`
+      GRANT SELECT, INSERT ON omni.stock_positions, omni.quota_slices, omni.quota_grants, omni.quota_grant_units,
+        omni.custody_receipts, omni.custody_units, omni.quota_claims, omni.quota_decisions, omni.shortfalls,
+        omni.replacement_units, omni.shortfall_resolutions TO ${role};
+      GRANT SELECT ON omni.quota_inventory TO ${role};
     `);
     await db.query('COMMIT');
   } catch (error) {

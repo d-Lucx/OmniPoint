@@ -2,11 +2,13 @@ import { randomUUID } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
+import type { Position } from './inventory-protocol.ts';
+import { availableQuota, enableQuota, importGrant, importReceipt } from './quota-local.ts';
 import {
   currency, digest, isLabel, isMinor, isScope, isSku, isUuid, jsonBytes, maxAckBytes,
-  parseEvent, printableReceipt, readBounded, sameScope, verifyVoucher,
+  parseEvent, printableReceipt, readBounded, sameScope, trustedEndpoint, verifyVoucher,
 } from './protocol.ts';
-import type { SaleEvent, Scope } from './protocol.ts';
+import type { SaleEvent, Scope, SignedEvidence } from './protocol.ts';
 
 export interface Checkout {
   requestId: string;
@@ -51,18 +53,35 @@ export class Terminal {
         throw new Error('Required SQLite durability settings unavailable');
       }
       this.write(() => {
-        const version = db.prepare('PRAGMA user_version').get()?.user_version;
-        if (version === 0) {
-          db.exec(readFileSync(new URL('../migrations/001-local.sql', import.meta.url), 'utf8'));
-          db.exec('PRAGMA user_version = 1');
-        } else if (version !== 1) {
-          throw new Error('Unsupported local schema');
+        const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
+        const files = ['001-local.sql', '002-local.sql'];
+        if (!Number.isInteger(version) || version < 0 || version > files.length) throw new Error('Unsupported local schema');
+        for (const [index, file] of files.entries()) {
+          if (index < version) continue;
+          db.exec(readFileSync(new URL(`../migrations/${file}`, import.meta.url), 'utf8'));
+          db.exec(`PRAGMA user_version = ${index + 1}`);
         }
       });
     } catch (error) {
       db.close();
       throw error;
     }
+  }
+
+  enableQuota(position: Position): void {
+    this.write(() => enableQuota(this.db, position));
+  }
+
+  importGrant(packet: SignedEvidence, keys: ReadonlyMap<string, KeyObject>): void {
+    this.write(() => {
+      const scope = this.scope();
+      if (!scope) throw new Error('Terminal must be enrolled');
+      importGrant(this.db, scope, packet, keys);
+    });
+  }
+
+  importCustody(packet: SignedEvidence, keys: ReadonlyMap<string, KeyObject>): void {
+    this.write(() => importReceipt(this.db, packet, keys));
   }
 
   close(): void {
@@ -145,16 +164,21 @@ export class Terminal {
       if (!item || item.currency !== currency || item.unit_minor !== input.cashMinor) {
         throw new Error('Exact cash tender for a catalog item is required');
       }
-      const stock = this.db.prepare('UPDATE catalog SET on_hand = on_hand - 1 WHERE sku = ? AND on_hand >= 1')
-        .run(input.sku);
-      if (stock.changes !== 1) throw new Error('Insufficient stock');
+      const occurredAt = new Date().toISOString();
+      const quota = availableQuota(this.db, input.sku, occurredAt);
+      if (!quota) {
+        const stock = this.db.prepare('UPDATE catalog SET on_hand = on_hand - 1 WHERE sku = ? AND on_hand >= 1')
+          .run(input.sku);
+        if (stock.changes !== 1) throw new Error('Insufficient stock');
+      }
       const counter = this.db.prepare(`
         UPDATE terminal SET next_sequence = next_sequence + 1 WHERE singleton = 1
         RETURNING next_sequence - 1 AS sequence
       `).get();
       const event: SaleEvent = {
-        ...scope, version: 1, saleId: randomUUID(), receiptId: randomUUID(),
-        sequence: Number(counter?.sequence), occurredAt: new Date().toISOString(), currency,
+        ...scope, ...(quota ? { version: 2, quota } as const : { version: 1 } as const),
+        saleId: randomUUID(), receiptId: randomUUID(),
+        sequence: Number(counter?.sequence), occurredAt, currency,
         line: { id: randomUUID(), sku: input.sku, label: String(item.label), quantity: 1,
           unitMinor: input.cashMinor, stockDelta: -1 },
         taxMinor: 0, totalMinor: input.cashMinor,
@@ -170,6 +194,7 @@ export class Terminal {
       this.db.prepare('INSERT INTO sale_lines VALUES (?, ?, ?, ?, ?, ?)')
         .run(event.line.id, event.saleId, input.sku, event.line.quantity, event.line.label, event.line.unitMinor);
       this.db.prepare('INSERT INTO stock_movements VALUES (?, ?)').run(event.line.id, event.line.stockDelta);
+      if (quota) this.db.prepare('INSERT INTO quota_spends VALUES (?, ?, ?)').run(quota.grantId, quota.sliceId, event.saleId);
       this.db.prepare("INSERT INTO outbox (sale_id, event_bytes, digest, state) VALUES (?, ?, ?, 'PENDING')")
         .run(event.saleId, bytes, digest(bytes));
       if (boundary) await boundary('before-commit');
@@ -202,10 +227,7 @@ export class Terminal {
   }
 
   async syncOnce(config: SyncConfig, now = Date.now()): Promise<string> {
-    const url = new URL(config.url);
-    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname))) {
-      throw new Error('HTTPS required outside loopback development');
-    }
+    const url = trustedEndpoint(config.url);
     const row = this.claim(now);
     if (!row) return 'IDLE';
     let state = 'RETRY_WAIT';
@@ -220,6 +242,11 @@ export class Terminal {
         headers: { authorization: `Bearer ${config.token}`, 'content-type': 'application/json' },
         body: bytes,
       });
+      if (response.status === 202 && event.version === 2) {
+        await response.body?.cancel();
+        result = 'HTTP_202';
+        throw new Error('Staged response is retryable');
+      }
       result = 'ACK_REJECTED';
       if (response.headers.has('content-encoding')) {
         await response.body?.cancel();
@@ -229,7 +256,7 @@ export class Terminal {
       const ack = verifyVoucher(response.status, body, response.headers, config.keys, event, row.digest);
       ackId = ack.ackId;
       result = ack.disposition;
-      state = result === 'COMMITTED' ? 'SYNCED' : 'CONFLICT_HELD';
+      state = result === 'COMMITTED' || result === 'BACKORDER' ? 'SYNCED' : 'CONFLICT_HELD';
     } catch {
       // An uncertain attempt must remain actionable.
     }

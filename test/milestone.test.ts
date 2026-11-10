@@ -280,7 +280,7 @@ test('M1-04 competing replays and signers converge, while both identity conflict
     await voucherLock.query('LOCK TABLE omni.vouchers IN SHARE MODE');
     first = upload(url, f.enrollment.token, bytes);
     void first.catch(() => {});
-    await waitForBlocked('UPDATE omni.stock SET', 1);
+    await waitForBlocked('FOR NO KEY UPDATE', 1);
     second = upload(secondUrl, f.enrollment.token, bytes);
     void second.catch(() => {});
     await waitForBlocked('INSERT INTO omni.sales', 1);

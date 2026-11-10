@@ -1,0 +1,6 @@
+node_modules/
+.env
+*.pem
+*.sqlite
+*.sqlite-*
+enrollments.local.json

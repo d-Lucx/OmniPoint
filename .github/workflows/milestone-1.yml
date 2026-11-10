@@ -1,0 +1,36 @@
+name: OmniPoint Milestone 1
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  durability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17.11-bookworm
+        env:
+          POSTGRES_USER: omnipoint_test_admin
+          POSTGRES_PASSWORD: local-test-admin-only
+          POSTGRES_DB: omnipoint_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U omnipoint_test_admin -d omnipoint_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      OMNI_TEST_DISPOSABLE: '1'
+      OMNI_TEST_ADMIN_URL: postgresql://omnipoint_test_admin:local-test-admin-only@127.0.0.1:55432/omnipoint_test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test

@@ -141,15 +141,19 @@ export class TerminalChild {
   private readonly exited: Promise<[number | null, NodeJS.Signals | null]>;
   private readonly ready: Promise<Message>;
 
-  constructor(path: string) {
+  constructor(path: string, entry = 'terminal-child.ts') {
     const { OMNI_TEST_ADMIN_URL: _admin, ...env } = process.env;
-    this.process = fork(fileURLToPath(new URL('terminal-child.ts', import.meta.url)), [path], {
+    this.process = fork(fileURLToPath(new URL(entry, import.meta.url)), [path], {
       stdio: ['ignore', 'ignore', 'inherit', 'ipc'], serialization: 'advanced', execArgv: [], env,
     });
     this.exited = once(this.process, 'exit') as typeof this.exited;
     void this.exited.catch(() => {});
     this.ready = this.receive();
     void this.ready.catch(() => {});
+  }
+
+  waitMessage(): Promise<Message> {
+    return this.receive();
   }
 
   private receive(payload?: object): Promise<Message> {
@@ -192,6 +196,7 @@ export async function testResources(t: TestContext) {
   const dir = await mkdtemp(join(tmpdir(), 'omnipoint-'));
   const children: TerminalChild[] = [];
   const servers: Server[] = [];
+  const disposers: Array<() => void> = [];
   t.after(async () => {
     try {
       await Promise.allSettled(children.map(child => child.kill())).then(results => {
@@ -205,6 +210,7 @@ export async function testResources(t: TestContext) {
           server.closeAllConnections();
         })));
       } finally {
+        for (const dispose of disposers) dispose();
         await rm(dir, { recursive: true, force: true, maxRetries: 4 });
       }
     }
@@ -214,6 +220,12 @@ export async function testResources(t: TestContext) {
   const publicPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
   return {
     dir, signer, publicKey, publicPem,
+    dispose(work: () => void) { disposers.push(work); },
+    spawn(path: string, entry: string) {
+      const child = new TerminalChild(path, entry);
+      children.push(child);
+      return child;
+    },
     register(enrollment: Enrollment) {
       const { token, ...scope } = enrollment;
       const path = join(dir, `${scope.terminalId}-${randomUUID()}.sqlite`);
@@ -236,9 +248,9 @@ export async function testResources(t: TestContext) {
         },
       };
     },
-    async listen(server: Server) {
+    async listen(server: Server, port = 0) {
       servers.push(server);
-      server.listen(0, '127.0.0.1');
+      server.listen(port, '127.0.0.1');
       await bounded(once(server, 'listening'), 'HTTP listen');
       return `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/sales`;
     },

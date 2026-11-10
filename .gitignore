@@ -5,3 +5,8 @@ node_modules/
 *.sqlite-*
 enrollments.local.json
 operators.local.json
+dist/
+register.local.json
+supervisors.local.json
+retail-operation.local.json
+grant-*.local.json

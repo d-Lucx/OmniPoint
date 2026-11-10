@@ -3,20 +3,33 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": "24.22.1" },
+  "engines": {
+    "node": "24.22.1"
+  },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --test --test-concurrency=1 test/milestone.test.ts test/quota.test.ts",
+    "test": "npm run build:register && node --test --test-concurrency=1 test/milestone.test.ts test/quota.test.ts test/retail.test.ts",
     "demo:m2": "node --test --test-name-pattern=M2-01 --test-name-pattern=M2-05 test/quota.test.ts",
     "terminal": "node src/terminal-cli.ts",
     "cloud": "node src/cloud-cli.ts",
     "inventory": "node src/inventory-cli.ts",
-    "migrate": "node src/migrate.ts"
+    "migrate": "node src/migrate.ts",
+    "build:register": "esbuild src/ui/register.tsx --bundle --minify --outfile=dist/register.js",
+    "register": "node src/register-cli.ts",
+    "demo:m3": "npm run build:register && node --test test/retail.test.ts"
   },
-  "dependencies": { "pg": "8.23.1" },
+  "dependencies": {
+    "pg": "8.23.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
   "devDependencies": {
     "@types/node": "24.19.2",
     "@types/pg": "8.23.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "esbuild": "0.28.2",
+    "playwright": "1.65.0",
     "typescript": "5.9.3"
   }
 }

@@ -14,6 +14,7 @@ type Destination = Pick<Scope, 'tenantId' | 'terminalId' | 'generation'>;
 export interface Grant extends Destination, Position {
   version: 1;
   kind: 'GRANT';
+  retail?: true;
   storeId: string;
   grantId: string;
   issuedAt: string;
@@ -22,6 +23,7 @@ export interface Grant extends Destination, Position {
   transfer: { id: string; dispatchLegId: string; sourceLocationId: string } | null;
 }
 export interface CustodyReceipt extends Destination {
+  observedAt?: string;
   version: 1;
   kind: 'CUSTODY_RECEIPT';
   positionId: string;
@@ -47,7 +49,8 @@ function validSlices(value: unknown): value is string[] {
 
 export function parseGrant(bytes: Buffer): Grant {
   const g = decode(bytes);
-  if (g.version !== 1 || g.kind !== 'GRANT' || !isPosition(g) || !isUuid(g.tenantId) || !isUuid(g.storeId) ||
+  if (g.version !== 1 || g.kind !== 'GRANT' || (g.retail !== undefined && g.retail !== true) ||
+      !isPosition(g) || !isUuid(g.tenantId) || !isUuid(g.storeId) ||
       !isUuid(g.terminalId) || !isCounter(g.generation) || !isUuid(g.grantId) || !validSlices(g.slices) ||
       !isIsoDate(g.issuedAt) || !isIsoDate(g.expiresAt) || g.issuedAt >= g.expiresAt ||
       Date.parse(g.expiresAt) - Date.parse(g.issuedAt) > maxGrantDurationMs) {
@@ -66,7 +69,8 @@ export function parseCustody(bytes: Buffer): CustodyReceipt {
   const r = decode(bytes);
   if (r.version !== 1 || r.kind !== 'CUSTODY_RECEIPT' || !isUuid(r.tenantId) || !isUuid(r.positionId) ||
       !isUuid(r.terminalId) || !isCounter(r.generation) || !isUuid(r.grantId) || !isUuid(r.transferId) ||
-      !isUuid(r.dispatchLegId) || !isUuid(r.legId) || r.legId === r.dispatchLegId || !validSlices(r.slices)) {
+      !isUuid(r.dispatchLegId) || !isUuid(r.legId) || r.legId === r.dispatchLegId || !validSlices(r.slices) ||
+      (r.observedAt !== undefined && !isIsoDate(r.observedAt))) {
     throw new Error('Invalid custody receipt');
   }
   return r as unknown as CustodyReceipt;

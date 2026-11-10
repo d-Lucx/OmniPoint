@@ -1,0 +1,28 @@
+{
+  "scope": {
+    "tenantId": "10000000-0000-4000-8000-000000000001",
+    "storeId": "20000000-0000-4000-8000-000000000001",
+    "terminalId": "30000000-0000-4000-8000-000000000001",
+    "generation": 1,
+    "cashierId": "40000000-0000-4000-8000-000000000001"
+  },
+  "drawerId": "50000000-0000-4000-8000-000000000001",
+  "supervisor": {
+    "actorId": "60000000-0000-4000-8000-000000000001",
+    "privateKeyFile": "supervisor-private.pem"
+  },
+  "positions": [
+    { "sku": "M1-ITEM", "positionId": "71000000-0000-4000-8000-000000000001", "locationId": "72000000-0000-4000-8000-000000000001" },
+    { "sku": "M3-RED", "positionId": "71000000-0000-4000-8000-000000000002", "locationId": "72000000-0000-4000-8000-000000000001" },
+    { "sku": "M3-TEA", "positionId": "71000000-0000-4000-8000-000000000003", "locationId": "72000000-0000-4000-8000-000000000001" }
+  ],
+  "catalog": {
+    "version": 1,
+    "taxVersion": 1,
+    "variants": [
+      { "sku": "M1-ITEM", "parentId": "MUG", "label": "Blue mug", "barcode": "210001", "unitMinor": 210, "taxBps": 500, "taxMode": "EXCLUSIVE" },
+      { "sku": "M3-RED", "parentId": "MUG", "label": "Red mug", "barcode": "210002", "unitMinor": 1100, "taxBps": 1000, "taxMode": "INCLUSIVE" },
+      { "sku": "M3-TEA", "parentId": "TEA", "label": "Tea bag", "barcode": "210003", "unitMinor": 300, "taxBps": 0, "taxMode": "EXCLUSIVE" }
+    ]
+  }
+}

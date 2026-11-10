@@ -19,6 +19,7 @@ import type { QuotaSale, SignedEvidence, Voucher } from '../src/protocol.ts';
 import { Terminal } from '../src/terminal.ts';
 import { bounded, latch, local, seed, testDatabase, testResources } from './fixture.ts';
 import type { TestDatabase, TerminalChild } from './fixture.ts';
+import { removeRetailCloudFixture, removeRetailLocalFixture } from './retail-fixture.ts';
 
 let database: TestDatabase;
 before(async () => { database = await testDatabase(); });
@@ -597,6 +598,8 @@ test('M2-06 populated v1 upgrade preserves bytes and vouchers, fences legacy sal
 
     // This isolated fixture contains real v1 checkout, cash and signed voucher data. Reconstruct the
     // v1 schema by removing only the empty additive M2 structures before exercising the forward runners.
+    removeRetailLocalFixture(a.path);
+    await removeRetailCloudFixture(db);
     const sqlite = new DatabaseSync(a.path);
     try {
       sqlite.exec(`
@@ -616,11 +619,11 @@ test('M2-06 populated v1 upgrade preserves bytes and vouchers, fences legacy sal
     `);
     await db.upgrade();
     const { rows: versions } = await db.fixture.query('SELECT version FROM omni.migrations ORDER BY version');
-    assert.deepEqual(versions, [{ version: 1 }, { version: 2 }]);
+    assert.deepEqual(versions, [{ version: 1 }, { version: 2 }, { version: 3 }]);
     const url = await f.listen(f.server());
     const upgraded = a.child();
     assert.deepEqual((await upgraded.send({ action: 'recover', requestId: a.input.requestId })).value, originalReceipt);
-    assert.equal(local(a.path, db => db.prepare('PRAGMA user_version').get()?.user_version), 2);
+    assert.equal(local(a.path, db => db.prepare('PRAGMA user_version').get()?.user_version), 3);
     assert.deepEqual(localState(a), before);
     assert.throws(() => withRegister(a, terminal => terminal.enableQuota(f.position)), /Drain/);
     assert.equal((await upgraded.send(a.sync(url))).value, 'SYNCED');

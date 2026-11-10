@@ -3,6 +3,8 @@ import type { KeyObject } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import type { Position } from './inventory-protocol.ts';
+import { RetailRegister } from './retail-local.ts';
+import type { RetailLocalOptions } from './retail-local.ts';
 import { availableQuota, enableQuota, importGrant, importReceipt } from './quota-local.ts';
 import {
   currency, digest, isLabel, isMinor, isScope, isSku, isUuid, jsonBytes, maxAckBytes,
@@ -54,7 +56,7 @@ export class Terminal {
       }
       this.write(() => {
         const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-        const files = ['001-local.sql', '002-local.sql'];
+        const files = ['001-local.sql', '002-local.sql', '003-local.sql'];
         if (!Number.isInteger(version) || version < 0 || version > files.length) throw new Error('Unsupported local schema');
         for (const [index, file] of files.entries()) {
           if (index < version) continue;
@@ -66,6 +68,12 @@ export class Terminal {
       db.close();
       throw error;
     }
+  }
+
+  retail(options: RetailLocalOptions): RetailRegister {
+    const scope = this.scope();
+    if (!scope) throw new Error('Enroll the terminal first');
+    return new RetailRegister(this.db, scope, options);
   }
 
   enableQuota(position: Position): void {
@@ -165,6 +173,9 @@ export class Terminal {
         throw new Error('Exact cash tender for a catalog item is required');
       }
       const occurredAt = new Date().toISOString();
+      if (this.db.prepare('SELECT 1 FROM retail_positions WHERE sku=?').get(input.sku)) {
+        throw new Error('Use a retail shift for this position');
+      }
       const quota = availableQuota(this.db, input.sku, occurredAt);
       if (!quota) {
         const stock = this.db.prepare('UPDATE catalog SET on_hand = on_hand - 1 WHERE sku = ? AND on_hand >= 1')

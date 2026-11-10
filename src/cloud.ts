@@ -4,6 +4,11 @@ import type { ServerResponse } from 'node:http';
 import type { Pool } from 'pg';
 import { inventoryAction } from './inventory-api.ts';
 import type { InventoryOptions } from './inventory-api.ts';
+import { ingestRetail } from './retail-cloud.ts';
+import { retailInventoryAction } from './retail-inventory.ts';
+import { parseRetail, retailBodyLimit } from './retail-protocol.ts';
+import type { RetailEvent } from './retail-protocol.ts';
+import { returnAction } from './retail-returns-cloud.ts';
 import { tenantTransaction } from './postgres.ts';
 import { admitQuota, decrementStock, InventoryError, lockStock, salePosition, saveOutcome, settleQuota } from './quota-cloud.ts';
 import {
@@ -18,10 +23,18 @@ type Claim = { body: Buffer } | { conflict: Conflict } | { staged: true };
 type Delivery = { bytes: Buffer; digest: string; event: SaleEvent };
 
 interface CloudObservers {
+  retailReceived?: (event: RetailEvent, bytes: Buffer) => void;
   received?: (delivery: Delivery) => void;
   saleCommitted?: (delivery: Delivery) => Promise<void>;
   beforeResponse?: (voucher: Voucher, response: ServerResponse) => Promise<void>;
   failed?: (error: unknown) => void;
+}
+
+function sendVoucher(response: ServerResponse, voucher: Voucher) {
+  if (!response.destroyed) response.writeHead(voucher.status, {
+    'content-type': 'application/json', 'content-length': voucher.bytes.length,
+    'omni-key-id': voucher.keyId, 'omni-algorithm': 'ed25519', 'omni-signature': voucher.signature,
+  }).end(voucher.bytes);
 }
 
 function pgConflict(error: unknown): boolean {
@@ -121,11 +134,13 @@ export function createCloud(
     }
     enrolled.set(token, scope);
   }
-  const operators = new Map<string, string>();
-  for (const { token, tenantId } of inventory.operators ?? []) {
+  const operators = new Map<string, { tenantId: string; actorId?: string }>();
+  for (const { token, tenantId, actorId } of inventory.operators ?? []) {
     if (!isUuid(tenantId) || typeof token !== 'string' || !/^[A-Za-z0-9_-]{24,128}$/.test(token) ||
-        enrolled.has(token) || operators.has(token)) throw new Error('Invalid inventory operator enrollment');
-    operators.set(token, tenantId);
+        enrolled.has(token) || operators.has(token) || (actorId !== undefined && !isUuid(actorId))) {
+      throw new Error('Invalid inventory operator enrollment');
+    }
+    operators.set(token, { tenantId, actorId });
   }
   const custodyKeys = inventory.custodyKeys ?? new Map<string, KeyObject>();
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(signer.id) ||
@@ -134,7 +149,9 @@ export function createCloud(
   }
   return createServer({ requestTimeout: 8000, headersTimeout: 5000 }, async (request, response) => {
     const operatorRoute = request.url === '/v2/inventory';
-    if (request.method !== 'POST' || (!operatorRoute && request.url !== '/v1/sales')) {
+    const retail = request.url === '/v3/register';
+    const refunds = request.url === '/v3/returns';
+    if (request.method !== 'POST' || (!operatorRoute && !retail && !refunds && request.url !== '/v1/sales')) {
       response.writeHead(404, { connection: 'close' }).end();
       return;
     }
@@ -149,13 +166,14 @@ export function createCloud(
       response.writeHead(415, { connection: 'close' }).end();
       return;
     }
-    if (Number(request.headers['content-length']) > maxEventBytes) {
+    const limit = retail ? retailBodyLimit : maxEventBytes;
+    if (Number(request.headers['content-length']) > limit) {
       response.writeHead(413, { connection: 'close' }).end();
       return;
     }
     let bytes: Buffer;
     try {
-      bytes = await readBounded(request.iterator({ destroyOnReturn: false }), maxEventBytes);
+      bytes = await readBounded(request.iterator({ destroyOnReturn: false }), limit);
     } catch {
       response.writeHead(400, { connection: 'close' }).end();
       return;
@@ -169,7 +187,9 @@ export function createCloud(
         return;
       }
       try {
-        const result = await inventoryAction(pool, operator, input, signer, custodyKeys);
+        const result = typeof input.action === 'string' && input.action.startsWith('retail-') ?
+          await retailInventoryAction(pool, operator.tenantId, operator.actorId, input) :
+          await inventoryAction(pool, operator.tenantId, input, signer, custodyKeys);
         response.writeHead(200, { 'content-type': 'application/json' }).end(jsonBytes(result));
       } catch (error) {
         const status = error instanceof InventoryError ? error.status :
@@ -180,6 +200,43 @@ export function createCloud(
     }
     if (!scope) {
       response.writeHead(401).end();
+      return;
+    }
+    if (retail || refunds) {
+      let input: RetailEvent | Record<string, unknown>;
+      try {
+        input = retail ? parseRetail(bytes) : decode(bytes);
+      } catch {
+        response.writeHead(400).end();
+        return;
+      }
+      try {
+        if (refunds) {
+          const result = await returnAction(pool, scope, input as Record<string, unknown>, inventory.supervisors ?? []);
+          sendVoucher(response, signVoucher(200, jsonBytes(result), signer));
+          return;
+        }
+        const event = input as RetailEvent;
+        if (!sameScope(event, scope)) {
+          response.writeHead(403).end();
+          return;
+        }
+        const authenticated = { ...event, ...scope };
+        observers?.retailReceived?.(authenticated, bytes);
+        const result = await ingestRetail(pool, authenticated, bytes, signer, custodyKeys, inventory.supervisors ?? []);
+        if ('hold' in result) {
+          response.writeHead(202, { 'content-type': 'application/json' }).end(jsonBytes({ reason: result.hold }));
+        } else {
+          await observers?.beforeResponse?.(result, response);
+          sendVoucher(response, result);
+        }
+      } catch (error) {
+        observers?.failed?.(error);
+        const status = error instanceof InventoryError ? error.status :
+          (typeof error === 'object' && error && 'code' in error && error.code === '23505' ? 409 : 503);
+        if (!response.destroyed) response.writeHead(status, { 'content-type': 'application/json' })
+          .end(jsonBytes({ reason: error instanceof InventoryError ? error.message : 'RETAIL_REQUEST_HELD' }));
+      }
       return;
     }
     let delivery: Delivery;
@@ -211,12 +268,7 @@ export function createCloud(
         voucher = await issueVoucher(pool, delivery.event, claim.body, signer);
       }
       await observers?.beforeResponse?.(voucher, response);
-      if (!response.destroyed) {
-        response.writeHead(voucher.status, {
-          'content-type': 'application/json', 'content-length': voucher.bytes.length,
-          'omni-key-id': voucher.keyId, 'omni-algorithm': 'ed25519', 'omni-signature': voucher.signature,
-        }).end(voucher.bytes);
-      }
+      sendVoucher(response, voucher);
     } catch (error) {
       observers?.failed?.(error);
       if (!response.destroyed) response.writeHead(error instanceof InventoryError ? error.status : 503).end();

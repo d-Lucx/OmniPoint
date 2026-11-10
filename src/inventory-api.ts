@@ -5,11 +5,13 @@ import { tenantTransaction } from './postgres.ts';
 import { fileCustody, inspectShortfall, InventoryError, issueGrant, openPosition, receiveReplacement, resolveShortfall } from './quota-cloud.ts';
 import { isCounter, isIsoDate, isSignedEvidence, isUuid } from './protocol.ts';
 import type { SigningKey } from './protocol.ts';
+import type { Supervisor } from './retail-protocol.ts';
 
-export interface InventoryOperator { tenantId: string; token: string }
+export interface InventoryOperator { tenantId: string; token: string; actorId?: string }
 export interface InventoryOptions {
   operators?: readonly InventoryOperator[];
   custodyKeys?: ReadonlyMap<string, KeyObject>;
+  supervisors?: readonly Supervisor[];
 }
 
 export async function inventoryAction(

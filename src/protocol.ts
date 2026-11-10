@@ -39,8 +39,11 @@ export type SaleEvent = (SaleFacts & { version: 1 }) | QuotaSale;
 export type Conflict = 'SALE_ID_CONFLICT' | 'SEQUENCE_CONFLICT';
 export type FinalDisposition = 'COMMITTED' | 'BACKORDER';
 export type Disposition = FinalDisposition | Conflict;
+export type VoucherEvent = Pick<SaleEvent, 'tenantId' | 'terminalId' | 'generation' | 'sequence' | 'saleId'> & {
+  version: 1 | 2 | 3;
+};
 export interface Ack {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   ackId: string;
   tenantId: string;
   terminalId: string;
@@ -49,6 +52,15 @@ export interface Ack {
   saleId: string;
   requestDigest: string;
   disposition: Disposition;
+}
+
+export function readQuotaSpend(value: unknown): QuotaSpend {
+  const q = record(value);
+  if (!isUuid(q.positionId) || !isUuid(q.locationId) || !isUuid(q.grantId) ||
+      !isUuid(q.sliceId) || !isDigest(q.grantDigest) ||
+      (q.custody !== undefined && !isSignedEvidence(q.custody))) throw new Error('Invalid quota spend');
+  const { positionId, locationId, grantId, sliceId, grantDigest, custody } = q;
+  return { positionId, locationId, grantId, sliceId, grantDigest, ...(custody ? { custody } : {}) };
 }
 export interface Voucher {
   status: number;
@@ -125,10 +137,7 @@ export function parseEvent(bytes: Uint8Array): SaleEvent {
     throw new Error('Invalid sale event');
   }
   if (e.version === 2) {
-    const quota = record(e.quota);
-    if (!isUuid(quota.positionId) || !isUuid(quota.locationId) || !isUuid(quota.grantId) ||
-        !isUuid(quota.sliceId) || !isDigest(quota.grantDigest) ||
-        (quota.custody !== undefined && !isSignedEvidence(quota.custody))) throw new Error('Invalid quota spend');
+    readQuotaSpend(e.quota);
   } else if (e.quota !== undefined) {
     throw new Error('Quota spend requires v2');
   }
@@ -151,7 +160,7 @@ export function printableReceipt(event: SaleEvent): string {
   ].join('\n');
 }
 
-export function ackBody(e: SaleEvent, requestDigest: string, disposition: Disposition): Ack {
+export function ackBody(e: VoucherEvent, requestDigest: string, disposition: Disposition): Ack {
   return {
     version: e.version, ackId: randomUUID(), tenantId: e.tenantId, terminalId: e.terminalId,
     generation: e.generation, sequence: e.sequence, saleId: e.saleId, requestDigest, disposition,
@@ -169,10 +178,7 @@ export function signVoucher(status: number, bytes: Buffer, signer: SigningKey): 
   return { status, bytes, keyId: signer.id, signature: sign(null, signedInput(status, bytes), signer.key).toString('base64url') };
 }
 
-export function verifyVoucher(
-  status: number, bytes: Buffer, headers: Headers, keys: ReadonlyMap<string, KeyObject>,
-  event: SaleEvent, requestDigest: string,
-): Ack {
+export function verifySignedResponse(status: number, bytes: Buffer, headers: Headers, keys: ReadonlyMap<string, KeyObject>): void {
   const key = keys.get(headers.get('omni-key-id') ?? '');
   const signature = headers.get('omni-signature') ?? '';
   if (bytes.length > maxAckBytes || headers.get('omni-algorithm') !== 'ed25519' ||
@@ -181,9 +187,16 @@ export function verifyVoucher(
       !verify(null, signedInput(status, bytes), key, Buffer.from(signature, 'base64url'))) {
     throw new Error('Invalid acknowledgment signature');
   }
+}
+
+export function verifyVoucher(
+  status: number, bytes: Buffer, headers: Headers, keys: ReadonlyMap<string, KeyObject>,
+  event: VoucherEvent, requestDigest: string,
+): Ack {
+  verifySignedResponse(status, bytes, headers, keys);
   const ack = decode(bytes);
   const validDisposition = (status === 200 && (ack.disposition === 'COMMITTED' ||
-    (event.version === 2 && ack.disposition === 'BACKORDER'))) ||
+    (event.version !== 1 && ack.disposition === 'BACKORDER'))) ||
     (status === 409 && (ack.disposition === 'SALE_ID_CONFLICT' || ack.disposition === 'SEQUENCE_CONFLICT'));
   if (!validDisposition || ack.version !== event.version || !isUuid(ack.ackId) ||
       ack.tenantId !== event.tenantId || ack.terminalId !== event.terminalId ||

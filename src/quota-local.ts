@@ -59,7 +59,9 @@ export function importReceipt(db: DatabaseSync, packet: SignedEvidence, keys: Re
   for (const slice of receipt.slices) unit.run(receipt.grantId, slice, receipt.legId);
 }
 
-export function availableQuota(db: DatabaseSync, sku: string, occurredAt: string): QuotaSpend | undefined {
+export function availableQuota(
+  db: DatabaseSync, sku: string, occurredAt: string, excluded: string[] = [], retail = false,
+): QuotaSpend | undefined {
   const position = db.prepare('SELECT position_id, location_id FROM quota_position WHERE sku = ?').get(sku);
   if (!position) return undefined;
   const row = db.prepare(`
@@ -68,10 +70,13 @@ export function availableQuota(db: DatabaseSync, sku: string, occurredAt: string
     LEFT JOIN custody_units cu USING (grant_id, slice_id)
     LEFT JOIN custody_receipts c USING (grant_id, leg_id)
     WHERE g.position_id = ? AND g.issued_at <= ? AND g.expires_at > ?
+      AND coalesce(json_extract(CAST(g.body AS TEXT), '$.retail'),0) = ?
       AND (g.transfer_id IS NULL OR c.leg_id IS NOT NULL)
       AND NOT EXISTS (SELECT 1 FROM quota_spends spent WHERE spent.slice_id = u.slice_id)
+      AND NOT EXISTS (SELECT 1 FROM retail_spends spent WHERE spent.slice_id = u.slice_id)
+      AND u.slice_id NOT IN (SELECT value FROM json_each(?))
     ORDER BY g.expires_at, g.grant_id, u.slice_id LIMIT 1
-  `).get(position.position_id, occurredAt, occurredAt) as {
+  `).get(position.position_id, occurredAt, occurredAt, Number(retail), JSON.stringify(excluded)) as {
     grant_id: string; digest: string; slice_id: string; body: Uint8Array | null; key_id: string; signature: string;
   } | undefined;
   if (!row) throw new Error('No usable offline quota');

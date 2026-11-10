@@ -7,7 +7,7 @@ import {
 } from './inventory-protocol.ts';
 import type { Grant, Position } from './inventory-protocol.ts';
 import { ackBody, digest, jsonBytes, parseEvent } from './protocol.ts';
-import type { FinalDisposition, QuotaSale, SaleEvent, SignedEvidence, SigningKey } from './protocol.ts';
+import type { FinalDisposition, QuotaSale, QuotaSpend, SaleEvent, Scope, SignedEvidence, SigningKey } from './protocol.ts';
 
 export class InventoryError extends Error {
   readonly status: number;
@@ -48,7 +48,7 @@ export async function salePosition(db: PoolClient, key: StockKey): Promise<Posit
   return position;
 }
 
-async function lockPosition(db: PoolClient, tenantId: string, positionId: string): Promise<StockPosition> {
+export async function lockPosition(db: PoolClient, tenantId: string, positionId: string): Promise<StockPosition> {
   const { rows: [position] } = await db.query<StockPosition>(`
     SELECT tenant_id AS "tenantId", store_id AS "storeId", position_id AS "positionId",
       location_id AS "locationId", sku FROM omni.stock_positions WHERE tenant_id = $1 AND position_id = $2
@@ -112,9 +112,12 @@ export async function issueGrant(
     [tenantId, position.positionId],
   );
   if (inventory.available < quantity) throw new InventoryError('Insufficient unencumbered inventory', 409);
+  const retail = await db.query('SELECT 1 FROM omni.retail_positions WHERE tenant_id=$1 AND position_id=$2',
+    [tenantId, position.positionId]);
   const grant: Grant = {
     version: 1, kind: 'GRANT', ...position, grantId, terminalId, generation, expiresAt, transfer,
     issuedAt: new Date(now).toISOString(), slices: Array.from({ length: quantity }, () => randomUUID()),
+    ...(retail.rowCount ? { retail: true } : {}),
   };
   const packet = signEvidence(grant, signer);
   await db.query(`
@@ -139,18 +142,17 @@ function verifiedReceipt(packet: SignedEvidence, keys: ReadonlyMap<string, KeyOb
   }
 }
 
-export async function admitQuota(
-  db: PoolClient, e: QuotaSale, position: Position | undefined, eventBytes: Buffer,
-  custodyKeys: ReadonlyMap<string, KeyObject>,
-): Promise<boolean> {
-  const q = e.quota;
+export async function checkQuotaEvidence(
+  db: PoolClient, e: Scope & { occurredAt: string }, q: QuotaSpend, sku: string, position: Position | undefined,
+  custodyKeys: ReadonlyMap<string, KeyObject>, retail = false,
+) {
   if (q.positionId !== position?.positionId || q.locationId !== position.locationId) {
     throw new InventoryError('Quota stock position mismatch');
   }
   const row = await getGrant(db, e.tenantId, q.grantId);
   if (!row || digest(row.body) !== q.grantDigest) throw new InventoryError('Unknown quota grant or digest mismatch');
   const grant = parseGrant(row.body);
-  if (!sameDestination(grant, e) || grant.storeId !== e.storeId || grant.sku !== e.line.sku ||
+  if (Boolean(grant.retail) !== retail || !sameDestination(grant, e) || grant.storeId !== e.storeId || grant.sku !== sku ||
       grant.positionId !== q.positionId || grant.locationId !== q.locationId || !grant.slices.includes(q.sliceId) ||
       e.occurredAt < grant.issuedAt || e.occurredAt >= grant.expiresAt || Date.parse(e.occurredAt) > Date.now() + 60_000) {
     throw new InventoryError('Invalid or out-of-scope quota spend');
@@ -184,6 +186,18 @@ export async function admitQuota(
   } else if (q.custody) {
     throw new InventoryError('Unexpected custody evidence');
   }
+  return { ready, legId, custodyDigest };
+}
+
+export async function admitQuota(
+  db: PoolClient, e: QuotaSale, position: Position | undefined, eventBytes: Buffer,
+  custodyKeys: ReadonlyMap<string, KeyObject>,
+): Promise<boolean> {
+  const q = e.quota;
+  const retail = await db.query('SELECT 1 FROM omni.retail_positions WHERE tenant_id=$1 AND position_id=$2',
+    [e.tenantId, q.positionId]);
+  if (retail.rowCount) throw new InventoryError('Retail protocol required for new sales at this position');
+  const { ready, legId, custodyDigest } = await checkQuotaEvidence(db, e, q, e.line.sku, position, custodyKeys);
   const claim = await db.query(`
     INSERT INTO omni.quota_claims (tenant_id, sale_id, position_id, grant_id, slice_id, event_bytes, custody_leg_id, custody_digest)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
@@ -236,7 +250,12 @@ export async function fileCustody(
   if (receipt.tenantId !== tenantId) throw new InventoryError('Receipt is outside operator scope', 403);
   await lockPosition(db, tenantId, receipt.positionId);
   const grant = await getGrant(db, tenantId, receipt.grantId);
-  if (!grant || !receiptMatchesGrant(receipt, parseGrant(grant.body))) throw new InventoryError('Receipt has no matching dispatch');
+  if (!grant) throw new InventoryError('Receipt has no matching dispatch');
+  const dispatch = parseGrant(grant.body);
+  if (!receiptMatchesGrant(receipt, dispatch) || (receipt.observedAt &&
+      (receipt.observedAt < dispatch.issuedAt || Date.parse(receipt.observedAt) > Date.now()))) {
+    throw new InventoryError('Receipt has no matching dispatch');
+  }
   const { positionId, grantId, legId, slices } = receipt;
   const hash = digest(bytes);
   const { rows: [prior] } = await db.query<{ body: Buffer }>(

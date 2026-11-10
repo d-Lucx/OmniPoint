@@ -43,7 +43,7 @@ export async function migrate(pool: Pool, runtimeRole: string): Promise<void> {
     await db.query('SELECT pg_advisory_xact_lock(71422101)');
     await db.query('CREATE SCHEMA IF NOT EXISTS omni');
     await db.query('CREATE TABLE IF NOT EXISTS omni.migrations (version integer PRIMARY KEY)');
-    const files = ['001-cloud.sql', '002-cloud.sql'];
+    const files = ['001-cloud.sql', '002-cloud.sql', '003-cloud.sql'];
     const { rows } = await db.query<{ version: number }>('SELECT version FROM omni.migrations');
     for (const [index, file] of files.entries()) {
       const version = index + 1;
@@ -63,6 +63,15 @@ export async function migrate(pool: Pool, runtimeRole: string): Promise<void> {
         omni.custody_receipts, omni.custody_units, omni.quota_claims, omni.quota_decisions, omni.shortfalls,
         omni.replacement_units, omni.shortfall_resolutions TO ${role};
       GRANT SELECT ON omni.quota_inventory TO ${role};
+    `);
+    await db.query(`
+      GRANT SELECT ON omni.quota_inventory_v2 TO ${role};
+      GRANT SELECT, INSERT ON omni.retail_catalogs, omni.retail_positions, omni.retail_shifts,
+        omni.retail_events, omni.retail_vouchers, omni.retail_receipts, omni.retail_lines, omni.retail_allocations,
+        omni.retail_shortfalls, omni.retail_cash, omni.retail_postings, omni.retail_closes, omni.retail_refunds,
+        omni.retail_stock_changes, omni.retail_counts, omni.retail_count_decisions TO ${role};
+      GRANT UPDATE (closed, source_no) ON omni.retail_shifts TO ${role};
+      GRANT UPDATE (state, payout_event_id, release_evidence) ON omni.retail_refunds TO ${role};
     `);
     await db.query('COMMIT');
   } catch (error) {

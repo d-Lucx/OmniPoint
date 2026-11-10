@@ -8,7 +8,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "npm run build:register && node --test --test-concurrency=1 test/milestone.test.ts test/quota.test.ts test/retail.test.ts",
+    "test": "npm run build:register && node --test --test-concurrency=1 test/milestone.test.ts test/quota.test.ts test/retail.test.ts test/payment.test.ts",
     "demo:m2": "node --test --test-name-pattern=M2-01 --test-name-pattern=M2-05 test/quota.test.ts",
     "terminal": "node src/terminal-cli.ts",
     "cloud": "node src/cloud-cli.ts",
@@ -16,7 +16,9 @@
     "migrate": "node src/migrate.ts",
     "build:register": "esbuild src/ui/register.tsx --bundle --minify --outfile=dist/register.js",
     "register": "node src/register-cli.ts",
-    "demo:m3": "npm run build:register && node --test test/retail.test.ts"
+    "demo:m3": "npm run build:register && node --test test/retail.test.ts",
+    "demo:m4": "npm run build:register && node --test test/payment.test.ts",
+    "payment:fixture": "node src/payment-fixture-cli.ts"
   },
   "dependencies": {
     "pg": "8.23.1",

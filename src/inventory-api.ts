@@ -6,12 +6,14 @@ import { fileCustody, inspectShortfall, InventoryError, issueGrant, openPosition
 import { isCounter, isIsoDate, isSignedEvidence, isUuid } from './protocol.ts';
 import type { SigningKey } from './protocol.ts';
 import type { Supervisor } from './retail-protocol.ts';
+import type { PaymentTrust } from './payment-cloud.ts';
 
 export interface InventoryOperator { tenantId: string; token: string; actorId?: string }
 export interface InventoryOptions {
   operators?: readonly InventoryOperator[];
   custodyKeys?: ReadonlyMap<string, KeyObject>;
   supervisors?: readonly Supervisor[];
+  payments?: PaymentTrust;
 }
 
 export async function inventoryAction(

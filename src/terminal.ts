@@ -56,7 +56,7 @@ export class Terminal {
       }
       this.write(() => {
         const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-        const files = ['001-local.sql', '002-local.sql', '003-local.sql'];
+        const files = ['001-local.sql', '002-local.sql', '003-local.sql', '004-local.sql'];
         if (!Number.isInteger(version) || version < 0 || version > files.length) throw new Error('Unsupported local schema');
         for (const [index, file] of files.entries()) {
           if (index < version) continue;

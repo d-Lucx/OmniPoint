@@ -88,6 +88,11 @@ async function reserve(db: PoolClient, scope: Scope, input: Record<string, unkno
     WHERE l.tenant_id=$1 AND l.line_id=$2 AND r.receipt_id=$3 AND s.store_id=$4 AND e.kind='SALE'
   `, [scope.tenantId, request.lineId, request.receiptId, scope.storeId]);
   if (!original) throw new InventoryError('ORIGINAL_RECEIPT_NOT_SYNCED_OR_IN_SCOPE', 409);
+  const card = await db.query(`
+    SELECT 1 FROM omni.retail_lines l JOIN omni.payment_cases c ON c.tenant_id=l.tenant_id AND c.sale_id=l.event_id
+    WHERE l.tenant_id=$1 AND l.line_id=$2
+  `, [scope.tenantId,request.lineId]);
+  if(card.rowCount) throw new InventoryError('CARD_RECEIPT_REQUIRES_CARD_REFUND_RAIL',409);
   if (original.held) throw new InventoryError('ORIGINAL_LINE_BACKORDER_HELD', 409);
   const { rows: reserved } = await db.query<{ ordinals: number[] }>(`
     SELECT ordinals FROM omni.retail_refunds WHERE tenant_id=$1 AND line_id=$2 AND state <> 'RELEASED'

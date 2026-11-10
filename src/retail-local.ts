@@ -1,4 +1,6 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { statSync,statfsSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { KeyObject } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { enableQuota, availableQuota } from './quota-local.ts';
@@ -13,12 +15,16 @@ import { releaseFacts, returnRequest } from './retail-return.ts';
 import type { ReturnReservation } from './retail-return.ts';
 import { observeDevice } from './retail-devices.ts';
 import type { DeviceAdapter, DeviceKind } from './retail-devices.ts';
+import { parseCard } from './card-event.ts';
+import { PaymentRegister } from './payment-local.ts';
+import type { PaymentOptions } from './payment-local.ts';
 
 export interface RetailLocalOptions {
   supervisor: { actorId: string; pin: string; signer: SigningKey };
   devices: DeviceAdapter;
   cloud?: { url: string; token: string; keys: ReadonlyMap<string, KeyObject> };
   deviceTimeoutMs?: number;
+  payment?: PaymentOptions;
 }
 type Shift = { shift_id: string; drawer_id: string; state: 'OPEN' | 'CLOSED' };
 type CartLine = { id: string; quote: Quote; quantity: number; discount: Adjustment | null };
@@ -32,11 +38,28 @@ export class RetailRegister {
   private readonly scope: Scope;
   private readonly options: RetailLocalOptions;
   private cloudState: 'UNKNOWN' | 'OFFLINE' | 'ONLINE' = 'UNKNOWN';
+  readonly payment?: PaymentRegister;
 
   constructor(db: DatabaseSync, scope: Scope, options: RetailLocalOptions) {
     this.db = db;
     this.scope = scope;
     this.options = options;
+    if (options.payment) this.payment = new PaymentRegister(db,scope,options.payment,{
+      build: id => {
+        const shift = this.open();
+        if (this.db.prepare("SELECT 1 FROM retail_refunds WHERE shift_id=? AND state IN ('RESERVED','UNCERTAIN')").get(shift.shift_id)) {
+          throw new Error('Resolve cash refund first');
+        }
+        return this.buildSale(id,undefined,true);
+      },
+      finalize: (sale,bytes,printable) => this.saveSale(sale,bytes,printable),
+      receipt: id => this.receipt(id),
+      approval: (pin,action,facts) => this.approval(pin,action,facts),
+      funds: async (action,payload) => {
+        const {response,body} = await this.cloud('funds','/v4/funds',jsonBytes({action,payload}));
+        verifySignedResponse(response.status,body,response.headers,this.options.cloud!.keys);
+      },
+    });
     this.db.prepare("UPDATE retail_devices SET state='UNCERTAIN', detail='INTERRUPTED' WHERE state='IN_FLIGHT'").run();
   }
 
@@ -47,9 +70,28 @@ export class RetailRegister {
       this.db.exec('COMMIT');
       return result;
     } catch (error) {
-      this.db.exec('ROLLBACK');
+      if(this.db.isTransaction) this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  private unfrozen(except?: string) {
+    if(this.db.prepare(`SELECT 1 FROM payment_intents WHERE state NOT IN ('FINALIZED','REFUNDED') AND intent_id<>?`)
+      .get(except ?? '')) throw new Error('A card payment owns this basket and shift cut');
+  }
+
+  storageStatus() {
+    const path=this.db.location();
+    let freeBytes:number|null=null;
+    let walBytes=0;
+    if(path) {
+      try { const stat=statfsSync(dirname(path)); freeBytes=stat.bavail*stat.bsize; } catch { /* Filesystem counters unavailable. */ }
+      try { walBytes=statSync(path+'-wal').size; } catch { /* No WAL file. */ }
+    }
+    const checkpoint=this.db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get();
+    return {freeBytes,walBytes,pages:this.db.prepare('PRAGMA page_count').get()?.page_count,
+      maxPages:this.db.prepare('PRAGMA max_page_count').get()?.max_page_count,
+      pendingWalFrames:Math.max(0,Number(checkpoint?.log??0)-Number(checkpoint?.checkpointed??0))};
   }
 
   installCatalog(value: unknown, positions: readonly Position[]): void {
@@ -105,12 +147,14 @@ export class RetailRegister {
   private event(id: unknown): RetailEvent | undefined {
     if (!isUuid(id)) throw new Error('Stable request UUID required');
     const row = this.db.prepare('SELECT event_bytes FROM retail_events WHERE event_id=?').get(id);
-    return row && parseRetail(Buffer.from(row.event_bytes as Uint8Array));
+    if(!row) return;
+    const bytes=Buffer.from(row.event_bytes as Uint8Array);
+    return record(JSON.parse(bytes.toString('utf8'))).version===4 ? parseCard(bytes).sale : parseRetail(bytes);
   }
 
-  private append(event: RetailEvent): void {
-    const bytes = jsonBytes(event);
-    parseRetail(bytes);
+  private append(event: RetailEvent, card?: Buffer): void {
+    const bytes = card ?? jsonBytes(event);
+    if(card) parseCard(bytes); else parseRetail(bytes);
     this.db.prepare('INSERT INTO retail_events (event_id,shift_id,source_no,kind,event_bytes,digest) VALUES (?,?,?,?,?,?)')
       .run(event.saleId, event.shiftId, event.sequence, event.kind, bytes, digest(bytes));
   }
@@ -160,6 +204,7 @@ export class RetailRegister {
       throw new Error('Malformed scan or SKU');
     }
     return this.write(() => {
+      this.unfrozen();
       const { shift_id } = this.open();
       const quote = this.catalog().find(item => (bySku ? item.sku : item.barcode) === code);
       if (!quote) throw new Error('Unknown item');
@@ -180,6 +225,7 @@ export class RetailRegister {
   setQuantity(id: unknown, units: unknown) {
     if (!isUuid(id) || (units !== 0 && !quantity(units))) throw new Error('Invalid quantity');
     this.write(() => {
+      this.unfrozen();
       const { shift_id } = this.open();
       if (units === 0) this.db.prepare('DELETE FROM retail_cart_lines WHERE id=? AND shift_id=?').run(id, shift_id);
       else this.db.prepare('UPDATE retail_cart_lines SET quantity=?,discount=NULL WHERE id=? AND shift_id=?').run(units, id, shift_id);
@@ -189,6 +235,7 @@ export class RetailRegister {
   discount(id: unknown, amount: unknown, reason: unknown, pin: unknown) {
     if (!isUuid(id) || !money(amount, 1) || !isLabel(reason)) throw new Error('Invalid discount');
     this.write(() => {
+      this.unfrozen();
       const { shift_id } = this.open();
       const line = this.cart(shift_id).find(line => line.id === id);
       if (!line) throw new Error('Unknown cart line');
@@ -214,6 +261,41 @@ export class RetailRegister {
     this.intent(event.saleId, 'PRINTER', printable);
   }
 
+  private buildSale(id:string,tender?:number,card=false): RetailSale {
+    this.unfrozen(card?id:undefined);
+    const {shift_id}=this.open();
+    const cart=this.cart(shift_id);
+    if(!cart.length) throw new Error('Cart is empty');
+    const head=this.header(shift_id,id);
+    const slices:string[]=[];
+    const lines:RetailLine[]=cart.map(line=>{
+      if(!this.db.prepare('SELECT 1 FROM retail_positions WHERE sku=?').get(line.quote.sku)) throw new Error('Retail quota required');
+      const units=Array.from({length:line.quantity},()=>{
+        const unit=availableQuota(this.db,line.quote.sku,head.occurredAt,slices,true);
+        if(!unit) throw new Error('Retail quota required');
+        slices.push(unit.sliceId);
+        return unit;
+      });
+      return {...line,units,...priceLine(line.quote,line.quantity,line.discount?.amount??0)};
+    });
+    const sum=totals(lines);
+    const tenderMinor=tender??sum.totalMinor;
+    if(tenderMinor<sum.totalMinor) throw new Error('Insufficient cash tender');
+    return {...head,kind:'SALE',receiptId:randomUUID(),lines,...sum,tenderMinor,changeMinor:tenderMinor-sum.totalMinor};
+  }
+
+  private saveSale(event:RetailSale,card?:Buffer,printable=salePrintable(event)) {
+    const current=this.header(this.open().shift_id,event.saleId);
+    if(current.shiftId!==event.shiftId||current.sequence!==event.sequence) throw new Error('Frozen shift cut changed');
+    this.append(event,card);
+    const spend=this.db.prepare('INSERT INTO retail_spends VALUES (?,?,?,?)');
+    for(const line of event.lines) for(const unit of line.units) spend.run(unit.sliceId,unit.grantId,line.id,event.saleId);
+    if(!card) this.cash(event,event.totalMinor);
+    this.saveReceipt(event,printable);
+    if(!card) this.intent(event.saleId,'DRAWER',null);
+    this.db.prepare('DELETE FROM retail_cart_lines WHERE shift_id=?').run(event.shiftId);
+  }
+
   async checkout(id: unknown, tender: unknown, boundary?: CheckoutBoundary): Promise<Receipt> {
     if (!isUuid(id) || !money(tender, 1)) throw new Error('Invalid checkout');
     this.db.exec('BEGIN IMMEDIATE');
@@ -221,37 +303,13 @@ export class RetailRegister {
     try {
       const previous = this.event(id);
       if (previous) {
+        if(this.db.prepare('SELECT 1 FROM fiscal_local_receipts WHERE intent_id=?').get(id)) throw new Error('Card receipt already issued');
         if (previous.kind !== 'SALE' || previous.tenderMinor !== tender) throw new Error('Checkout request conflict');
         receipt = this.receipt(id)!;
         this.db.exec('COMMIT');
         return receipt;
       }
-      const { shift_id } = this.open();
-      const cart = this.cart(shift_id);
-      if (!cart.length) throw new Error('Cart is empty');
-      const head = this.header(shift_id, id);
-      const slices: string[] = [];
-      const lines: RetailLine[] = cart.map(line => {
-        if (!this.db.prepare('SELECT 1 FROM retail_positions WHERE sku=?').get(line.quote.sku)) throw new Error('Retail quota required');
-        const units = Array.from({ length: line.quantity }, () => {
-          const unit = availableQuota(this.db, line.quote.sku, head.occurredAt, slices, true);
-          if (!unit) throw new Error('Retail quota required');
-          slices.push(unit.sliceId);
-          return unit;
-        });
-        return { ...line, units, ...priceLine(line.quote, line.quantity, line.discount?.amount ?? 0) };
-      });
-      const sum = totals(lines);
-      if (tender < sum.totalMinor) throw new Error('Insufficient cash tender');
-      const event: RetailSale = { ...head, kind: 'SALE', receiptId: randomUUID(), lines, ...sum,
-        tenderMinor: tender, changeMinor: tender - sum.totalMinor };
-      this.append(event);
-      const spend = this.db.prepare('INSERT INTO retail_spends VALUES (?,?,?,?)');
-      for (const line of lines) for (const unit of line.units) spend.run(unit.sliceId, unit.grantId, line.id, id);
-      this.cash(event, event.totalMinor);
-      this.saveReceipt(event, salePrintable(event));
-      this.intent(id, 'DRAWER', null);
-      this.db.prepare('DELETE FROM retail_cart_lines WHERE shift_id=?').run(shift_id);
+      this.saveSale(this.buildSale(id,tender));
       receipt = this.receipt(id)!;
       if (boundary) await boundary('before-commit');
       this.db.exec('COMMIT');
@@ -267,6 +325,7 @@ export class RetailRegister {
     if (!isUuid(id) || !isUuid(destinationId) || !money(amountMinor, 1)) throw new Error('Invalid drawer drop');
     this.authorized(pin);
     this.write(() => {
+      this.unfrozen();
       const previous = this.event(id);
       if (previous) {
         if (previous.kind !== 'DROP' || previous.amountMinor !== amountMinor || previous.destinationId !== destinationId) throw new Error('Request conflict');
@@ -289,6 +348,7 @@ export class RetailRegister {
     const count = record(counts) as Record<string, number>;
     const counted = blindTotal(count);
     return this.write(() => {
+      this.unfrozen();
       if (revision) this.authorized(revision.pin);
       const previous = this.event(id);
       if (previous) {
@@ -415,6 +475,7 @@ export class RetailRegister {
   }
 
   async reserveReturn(input: Record<string, unknown>, pin: unknown) {
+    this.unfrozen();
     const shift = this.open();
     const request = returnRequest({ ...input, shiftId: shift.shift_id });
     const approval = this.approval(pin, 'reserve-return', request);
@@ -442,6 +503,7 @@ export class RetailRegister {
   }
 
   async beginPayout(id: unknown) {
+    this.unfrozen();
     const refund = this.refund(id);
     if (!refund || refund.state !== 'RESERVED' || this.open().shift_id !== refund.reservation.shiftId) {
       throw new Error('Payout held for reconciliation');
@@ -487,6 +549,7 @@ export class RetailRegister {
   confirmPayout(id: unknown, pin: unknown) {
     this.authorized(pin);
     return this.write(() => {
+      this.unfrozen();
       const refund = this.refund(id);
       if (!refund) throw new Error('Unknown return');
       const r = refund.reservation;
@@ -521,22 +584,25 @@ export class RetailRegister {
       this.db.prepare('INSERT INTO retail_attempts VALUES (?,?,?,NULL)').run(id, attempt, now);
       return { id, attempt, bytes: Buffer.from(row.event_bytes as Uint8Array), digest: String(row.digest) };
     });
-    if (!item) return 'IDLE';
+    if (!item) return await this.payment?.syncFunds() ? 'FUNDS_CHECKED' : 'IDLE';
     let state = 'RETRY_WAIT';
     let result = 'TRANSPORT_ERROR';
     let ackId: string | null = null;
     let ackBytes: Buffer | null = null;
     try {
-      const event = parseRetail(item.bytes);
+      const card = record(JSON.parse(item.bytes.toString('utf8'))).version===4;
+      const event = card ? parseCard(item.bytes).sale : parseRetail(item.bytes);
       if (event.saleId !== item.id || digest(item.bytes) !== item.digest) throw new Error('Invalid stored retail event');
-      const { response, body } = await this.cloud('sync', '/v3/register', item.bytes);
+      const { response, body } = await this.cloud('sync', card?'/v4/register':'/v3/register', item.bytes);
       result = 'ACK_REJECTED';
       if (response.status === 202) {
         const reason = body.length ? JSON.parse(body.toString('utf8')).reason : '';
-        result = ['SHIFT_OPEN_MISSING','SHIFT_SEQUENCE_GAP','CUSTODY_RECEIPT_MISSING'].includes(reason) ? reason : 'HTTP_202';
+        result = ['SHIFT_OPEN_MISSING','SHIFT_SEQUENCE_GAP','CUSTODY_RECEIPT_MISSING','FISCAL_GAP','FISCAL_FORK',
+          'FISCAL_RETIRED','FISCAL_DEPENDENCY_HELD'].includes(reason) ? reason : 'HTTP_202';
       }
       else {
-        const ack = verifyVoucher(response.status, body, response.headers, this.options.cloud!.keys, event, item.digest);
+        const ack = verifyVoucher(response.status, body, response.headers, this.options.cloud!.keys,
+          card?{...event,version:4}:event, item.digest);
         if (ack.disposition === 'BACKORDER' && event.kind !== 'SALE') throw new Error('Unexpected backorder');
         if (event.kind === 'SALE' && (ack.disposition === 'BACKORDER' || ack.disposition === 'COMMITTED')) {
           const lines: unknown = JSON.parse(body.toString('utf8')).lines;
@@ -564,6 +630,7 @@ export class RetailRegister {
       `).run(state, result, ackBytes, ackId, item.id, item.attempt);
       if (!changed.changes) return 'LEASE_LOST';
       this.db.prepare('UPDATE retail_attempts SET result=? WHERE event_id=? AND attempt=?').run(result, item.id, item.attempt);
+      if(state==='SYNCED') this.db.prepare("UPDATE payment_intents SET reported=1 WHERE intent_id=? AND state='FINALIZED'").run(item.id);
       return state;
     });
   }
@@ -583,6 +650,10 @@ export class RetailRegister {
       }));
     return {
       shift, cart, catalog: this.catalog(), totals: totals(cart), cloud: this.cloudState,
+      paymentsEnabled:Boolean(this.payment),
+      payments:this.db.prepare(`SELECT intent_id,state,reason,
+        json_extract(fiscal_intent,'$.sequence') AS fiscal_sequence,json_extract(fiscal_intent,'$.epochId') AS fiscal_epoch
+        FROM payment_intents ORDER BY rowid DESC LIMIT 40`).all(),
       close: shift?.state === 'CLOSED' ? this.db.prepare('SELECT * FROM retail_closes WHERE shift_id=? ORDER BY rowid DESC LIMIT 1').get(shift.shift_id) : null,
       outbox, pendingCount: Number(this.db.prepare("SELECT count(*) AS n FROM retail_events WHERE state <> 'SYNCED'").get()?.n),
       devices: this.db.prepare(`

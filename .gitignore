@@ -10,3 +10,4 @@ register.local.json
 supervisors.local.json
 retail-operation.local.json
 grant-*.local.json
+*.local.json

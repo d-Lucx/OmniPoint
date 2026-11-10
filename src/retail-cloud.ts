@@ -13,6 +13,7 @@ type LineOutcome = { lineId: string; fulfilled: number; backordered: number };
 type Allocation = { winner: string; fulfilled: boolean };
 type SalePlan = { results: LineOutcome[]; allocations: Map<string, Allocation> };
 type Admission = { body: Buffer } | { conflict: Conflict } | { hold: string };
+type CardApplication = { printable:string; apply: (db:PoolClient)=>Promise<void> };
 interface Stored { digest: string; ack: Buffer }
 interface VoucherRow { key_id: string; signature: string }
 type Shift = NonNullable<Awaited<ReturnType<typeof retailShift>>>;
@@ -85,9 +86,9 @@ async function postMoney(db: PoolClient, e: RetailEvent, basis: number, tax: num
   }
 }
 
-async function writeSale(db: PoolClient, e: RetailSale, plan: SalePlan) {
+async function writeSale(db: PoolClient, e: RetailSale, plan: SalePlan, card?:CardApplication) {
   await db.query('INSERT INTO omni.retail_receipts VALUES ($1,$2,$3,NULL,$4)',
-    [e.tenantId, e.receiptId, e.saleId, salePrintable(e)]);
+    [e.tenantId, e.receiptId, e.saleId, card?.printable ?? salePrintable(e)]);
   for (const [index, line] of e.lines.entries()) {
     const position = line.units[0].positionId;
     await db.query('INSERT INTO omni.retail_lines VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
@@ -103,8 +104,11 @@ async function writeSale(db: PoolClient, e: RetailSale, plan: SalePlan) {
     if (plan.results[index].backordered) await db.query('INSERT INTO omni.retail_shortfalls VALUES ($1,$2,$3)',
       [e.tenantId, line.id, plan.results[index].backordered]);
   }
-  await cash(db, e, e.tenderMinor - e.changeMinor);
-  await postMoney(db, e, e.basisMinor, e.taxMinor, 1);
+  if(card) await card.apply(db);
+  else {
+    await cash(db, e, e.tenderMinor - e.changeMinor);
+    await postMoney(db, e, e.basisMinor, e.taxMinor, 1);
+  }
 }
 
 async function writeCount(db: PoolClient, e: RetailCount, supervisors: readonly Supervisor[]) {
@@ -126,11 +130,11 @@ async function writeCount(db: PoolClient, e: RetailCount, supervisors: readonly 
       variance - (previous?.variance_minor ?? 0)]);
 }
 
-async function admit(
-  pool: Pool, e: RetailEvent, bytes: Buffer, custodyKeys: ReadonlyMap<string, KeyObject>, supervisors: readonly Supervisor[],
+export async function admitRetail(
+  db: PoolClient, e: RetailEvent, bytes: Buffer, custodyKeys: ReadonlyMap<string, KeyObject>, supervisors: readonly Supervisor[],
+  card?:CardApplication,
 ): Promise<Admission> {
   const hash = digest(bytes);
-  return tenantTransaction(pool, e.tenantId, async db => {
     const known = await loadStored(db, e, hash);
     if (known) return known;
     if (e.kind === 'OPEN') {
@@ -157,13 +161,13 @@ async function admit(
         [e.tenantId, e.shiftId]);
       if (pending.rowCount) throw new InventoryError('PENDING_PAYOUT_BLOCKS_DROP', 409);
     }
-    const ack = ackBody(e, hash, plan?.results.some(line => line.backordered) ? 'BACKORDER' : 'COMMITTED');
+    const ack = ackBody(card?{...e,version:4}:e, hash, plan?.results.some(line => line.backordered) ? 'BACKORDER' : 'COMMITTED');
     const body = jsonBytes(plan ? { ...ack, lines: plan.results } : ack);
     await db.query('INSERT INTO omni.retail_events VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
       [e.tenantId, e.saleId, e.shiftId, e.sequence, e.kind, bytes, hash, body]);
     switch (e.kind) {
       case 'OPEN': await cash(db, e, e.floatMinor); break;
-      case 'SALE': await writeSale(db, e, plan!); break;
+      case 'SALE': await writeSale(db, e, plan!,card); break;
       case 'DROP': await cash(db, e, -e.amountMinor, e.destinationId); break;
       case 'RETURN': {
         await db.query('INSERT INTO omni.retail_receipts VALUES ($1,$2,$3,$4,$5)',
@@ -181,14 +185,19 @@ async function admit(
     await db.query('UPDATE omni.retail_shifts SET source_no=$3,closed=$4 WHERE tenant_id=$1 AND shift_id=$2',
       [e.tenantId, e.shiftId, e.sequence, e.kind === 'CLOSE' || e.kind === 'REVISION']);
     return { body };
-  });
 }
 
 export async function ingestRetail(
   pool: Pool, event: RetailEvent, bytes: Buffer, signer: SigningKey,
   custodyKeys: ReadonlyMap<string, KeyObject>, supervisors: readonly Supervisor[],
 ): Promise<Voucher | { hold: string }> {
-  const result = await admit(pool, event, bytes, custodyKeys, supervisors);
+  const result = await tenantTransaction(pool,event.tenantId,db=>admitRetail(db,event,bytes,custodyKeys,supervisors));
+  return voucherRetail(pool,event,bytes,signer,result);
+}
+
+export async function voucherRetail(
+  pool:Pool,event:import('./protocol.ts').VoucherEvent,bytes:Buffer,signer:SigningKey,result:Admission,
+): Promise<Voucher|{hold:string}> {
   if ('hold' in result) return result;
   if ('conflict' in result) return signVoucher(409, jsonBytes(ackBody(event, digest(bytes), result.conflict)), signer);
   return tenantTransaction(pool, event.tenantId, async db => {

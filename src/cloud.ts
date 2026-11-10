@@ -8,6 +8,9 @@ import { ingestRetail } from './retail-cloud.ts';
 import { retailInventoryAction } from './retail-inventory.ts';
 import { parseRetail, retailBodyLimit } from './retail-protocol.ts';
 import type { RetailEvent } from './retail-protocol.ts';
+import { cardBodyLimit,parseCard } from './card-event.ts';
+import { fiscalOperator,ingestCard } from './fiscal-cloud.ts';
+import { inspectPayment,paymentAction } from './payment-cloud.ts';
 import { returnAction } from './retail-returns-cloud.ts';
 import { tenantTransaction } from './postgres.ts';
 import { admitQuota, decrementStock, InventoryError, lockStock, salePosition, saveOutcome, settleQuota } from './quota-cloud.ts';
@@ -23,6 +26,7 @@ type Claim = { body: Buffer } | { conflict: Conflict } | { staged: true };
 type Delivery = { bytes: Buffer; digest: string; event: SaleEvent };
 
 interface CloudObservers {
+  cardReceived?: (bytes:Buffer)=>void;
   retailReceived?: (event: RetailEvent, bytes: Buffer) => void;
   received?: (delivery: Delivery) => void;
   saleCommitted?: (delivery: Delivery) => Promise<void>;
@@ -151,7 +155,9 @@ export function createCloud(
     const operatorRoute = request.url === '/v2/inventory';
     const retail = request.url === '/v3/register';
     const refunds = request.url === '/v3/returns';
-    if (request.method !== 'POST' || (!operatorRoute && !retail && !refunds && request.url !== '/v1/sales')) {
+    const card = request.url === '/v4/register';
+    const funds = request.url === '/v4/funds';
+    if (request.method !== 'POST' || (!operatorRoute && !retail && !refunds && !card && !funds && request.url !== '/v1/sales')) {
       response.writeHead(404, { connection: 'close' }).end();
       return;
     }
@@ -166,7 +172,7 @@ export function createCloud(
       response.writeHead(415, { connection: 'close' }).end();
       return;
     }
-    const limit = retail ? retailBodyLimit : maxEventBytes;
+    const limit = card?cardBodyLimit:retail?retailBodyLimit:maxEventBytes;
     if (Number(request.headers['content-length']) > limit) {
       response.writeHead(413, { connection: 'close' }).end();
       return;
@@ -187,7 +193,11 @@ export function createCloud(
         return;
       }
       try {
-        const result = typeof input.action === 'string' && input.action.startsWith('retail-') ?
+        const result = input.action==='payment-inspect'&&inventory.payments&&operator.actorId ?
+          await inspectPayment(pool,operator.tenantId,input) :
+          typeof input.action==='string'&&input.action.startsWith('fiscal-')&&inventory.payments&&operator.actorId ?
+          await fiscalOperator(pool,operator.tenantId,input,inventory.payments) :
+          typeof input.action === 'string' && input.action.startsWith('retail-') ?
           await retailInventoryAction(pool, operator.tenantId, operator.actorId, input) :
           await inventoryAction(pool, operator.tenantId, input, signer, custodyKeys);
         response.writeHead(200, { 'content-type': 'application/json' }).end(jsonBytes(result));
@@ -200,6 +210,28 @@ export function createCloud(
     }
     if (!scope) {
       response.writeHead(401).end();
+      return;
+    }
+    if(card||funds) {
+      if(!inventory.payments) { response.writeHead(404).end(); return; }
+      try {
+        if(funds) {
+          const result=await paymentAction(pool,scope,decode(bytes),inventory.payments,inventory.supervisors??[]);
+          sendVoucher(response,signVoucher(200,jsonBytes(result),signer));
+        } else {
+          parseCard(bytes);
+          observers?.cardReceived?.(bytes);
+          const result=await ingestCard(pool,scope,bytes,signer,inventory.payments,custodyKeys,inventory.supervisors??[]);
+          if('hold' in result) response.writeHead(202,{'content-type':'application/json'}).end(jsonBytes({reason:result.hold}));
+          else { await observers?.beforeResponse?.(result,response); sendVoucher(response,result); }
+        }
+      } catch(error) {
+        observers?.failed?.(error);
+        const status=error instanceof InventoryError?error.status:
+          typeof error==='object'&&error&&'code' in error?503:422;
+        if(!response.destroyed) response.writeHead(status,{'content-type':'application/json'})
+          .end(jsonBytes({reason:error instanceof InventoryError?error.message:'PAYMENT_OR_FISCAL_REQUEST_HELD'}));
+      }
       return;
     }
     if (retail || refunds) {

@@ -5,6 +5,8 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { decode, digest, jsonBytes, readBounded } from './protocol.ts';
 import type { RetailRegister } from './retail-local.ts';
+import { exact } from './authority.ts';
+import { webhookPacket } from './payment-local.ts';
 
 const shell = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OmniPoint Retail Register</title><link rel="stylesheet" href="/register.css"><script defer src="/register.js"></script></head>
@@ -30,6 +32,7 @@ export function createRegisterServer(register: RetailRegister, options: Register
   async function execute(input: Record<string, unknown>) {
     switch (input.action) {
       case 'state': return;
+      case 'storage': return register.storageStatus();
       case 'open': return register.openShift(input.id, options.drawerId, input.floatMinor);
       case 'scan': return register.scan(input.code);
       case 'add': return register.scan(input.sku, true);
@@ -39,6 +42,21 @@ export function createRegisterServer(register: RetailRegister, options: Register
         const receipt = await register.checkout(input.id, input.tenderMinor, options.checkoutBoundary);
         await register.dispatchEvent(receipt.eventId);
         return receipt;
+      }
+      case 'card-start':
+      case 'card-recover':
+      case 'card-retry':
+      case 'card-refund':
+      case 'card-replace': {
+        if(!register.payment) throw new Error('Card reader is unavailable');
+        exact(input,input.action==='card-refund'||input.action==='card-replace'?['action','id','reason','pin']:['action','id']);
+        const payment=register.payment;
+        const result=input.action==='card-start'?await payment.start(input.id):
+          input.action==='card-refund'?await payment.refund(input.id,input.reason,input.pin):
+          input.action==='card-replace'?await payment.replace(input.id,input.reason,input.pin):
+          await payment.recover(input.id,input.action==='card-retry');
+        if(result.state==='FINALIZED') await register.dispatchEvent(result.intentId);
+        return result;
       }
       case 'receipt': return register.receipt(input.id);
       case 'reprint': return register.reprint(input.id, input.commandId);
@@ -82,6 +100,18 @@ export function createRegisterServer(register: RetailRegister, options: Register
       else if (req.url === '/register.js') res.writeHead(200, { 'content-type': 'text/javascript' }).end(bundle);
       else if (req.url === '/register.css') res.writeHead(200, { 'content-type': 'text/css' }).end(css);
       else res.writeHead(404).end();
+      return;
+    }
+    if(req.method==='POST'&&req.url==='/api/provider-webhook'&&register.payment) {
+      if(req.headers['content-type']!=='application/json'||req.headers['content-encoding']) {
+        res.writeHead(415).end();
+        return;
+      }
+      try {
+        const bytes=await readBounded(req.iterator({destroyOnReturn:false}),3072);
+        await register.payment.webhook(webhookPacket(bytes,req.headers));
+        res.writeHead(202).end();
+      } catch { res.writeHead(422).end(); }
       return;
     }
     if (req.method !== 'POST' || req.url !== '/api/register') {

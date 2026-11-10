@@ -1,4 +1,4 @@
-# OmniPoint Milestones 1 through 3
+# OmniPoint Milestones 1 through 4
 
 OmniPoint completes a single-terminal cash sale offline and synchronizes it after a crash and a lost cloud response. Milestone 2 extends that path to two terminals with signed offline quotas and durable inventory arbitration. Milestone 3 adds the retail register, blind shifts, receipt-linked cash returns and custody-aware recount.
 
@@ -253,3 +253,73 @@ Submit operator actions as JSON files using the same inventory CLI as M2. The op
 - The retail event and its cash, quota, receipt, and device intents commit atomically on SQLite. The cloud accepts a shift's source sequence contiguously and serializes affected stock rows by SKU. Final `BACKORDER` means at least one valid line unit lost. Other lines may be fulfilled, and the single sale journal covers the accepted cash. Missing custody returns a retryable HTTP 202 before the sale's cloud effects. The terminal retries from its durable outbox once receipt evidence is filed. The same stored Ed25519 voucher authenticates the final line outcomes on replay.
 - Printer and drawer commands execute through simulators after the local transaction. Paper-out and disconnect are known failures. Timeout or interruption remains uncertain even when a delayed response later arrives. An operator records a check without automatic re-pulsing. Reprint uses the original receipt bytes and a separate printer command. The browser test exercised a keyboard-wedge input sequence with ordinary typing and malformed scans. Physical USB scanners, printers, drawers and fiscal devices were outside the verification.
 - Run the cloud owner migration before launching v3. SQLite applies `003-local.sql` on open. The additive migrations preserve stored v1/v2 receipts, bytes, digests and vouchers. Drain legacy outboxes and settle active v2 reservations before enabling retail for a position. New v1/v2 effects remain fenced there. Previously admitted legacy events can replay. V3 accepts only signed grants issued in retail mode after cutover. Recount uses the stock anchor and keeps unresolved grants fenced. Late evidence can correct attribution at the original cut without a stock movement. A changed book cut holds an adjustment for a fresh observation.
+
+## Milestone 4 card payments and fiscal recovery
+
+### Run the verified fault paths
+
+Use the disposable PostgreSQL service and Playwright setup above. The demo starts the simulated provider and fiscal signer as separate loopback HTTP services with separate SQLite files and test-only fault controls. The register runs in a separate process for the crash tests.
+
+```powershell
+npm.cmd ci --ignore-scripts
+npm.cmd run check
+npm.cmd test
+npm.cmd run demo:m4
+npm.cmd run build:register
+node --test --test-name-pattern=M4-01 test/payment.test.ts
+```
+
+M4-01 uses the existing register in Edge or Chromium. It waits for a provider capture to commit, kills the POS while the attempt is still `MAY_HAVE_SENT`, and drops the provider response. After restarting the provider against its original SQLite file and the register against its own file, the operator checks the original attempt. The sale becomes a signed fiscal receipt for 220¢. The test then drops the first final cloud voucher response and checks byte-for-byte replay and durable outbox retirement. The remaining demo tests cover unknown provider status, authenticated duplicate evidence, refunds, signer death and grants, fiscal gaps and forks, `SQLITE_FULL`, and migration and boundary controls.
+
+### Run the fixtures with the interactive register
+
+Start with the fresh disposable M3 register and catalog configuration above. Apply `node --env-file=.env src/migrate.ts` for migration 004. The terminal applies `004-local.sql` when it opens the database. Use separate files for the POS, provider, and fiscal signer databases and one writer process per file. Use only synthetic card entry at the reader fixture. No browser card-entry fields are required.
+
+1. Generate three separate Ed25519 pairs for the provider, fiscal authority, and fiscal device. Use the key-generation pattern from the M3 walkthrough with distinct names. The provider signing key ID matches `providerId`. The device signing key ID matches its UUID `deviceId`. Keep the fiscal authority private key in the operator's issuance environment. Its public key is the root for enrollment, genesis, and grants.
+2. Create three facts files from the register's `scope` object. Copy all five scope fields into each file. Add `deviceId`, `epochId`, and `series` to each. Use separate UUIDs for the device and epoch and a series such as `DemoSeries`.
+
+   | Facts file | Additional fields |
+   | --- | --- |
+   | `enrollment-facts.local.json` | `publicKey` containing the device's DER SPKI public key encoded as unpadded base64url |
+   | `genesis-facts.local.json` | `previousEpochId: null` for the first epoch, or the exact retired epoch UUID for replacement |
+   | `grant-facts.local.json` | A unique `grantId`, sequence `start` and `end` inclusive, and UTC ISO `issuedAt` and `expiresAt` with milliseconds. The range covers at most 100 slots and the interval at most 24 hours. |
+
+   Convert a PEM public key with `node -e "const {createPublicKey}=require('node:crypto'); const fs=require('node:fs'); console.log(createPublicKey(fs.readFileSync('device-public.pem')).export({type:'spki',format:'der'}).toString('base64url'))"`. Sign each file under its own purpose with the authority key.
+
+   ```powershell
+   node src/payment-fixture-cli.ts sign enrollment-facts.local.json fiscal-enrollment fiscal-root authority-private.pem | Set-Content -Encoding utf8 enrollment.local.json
+   node src/payment-fixture-cli.ts sign genesis-facts.local.json fiscal-genesis fiscal-root authority-private.pem | Set-Content -Encoding utf8 genesis.local.json
+   node src/payment-fixture-cli.ts sign grant-facts.local.json fiscal-grant fiscal-root authority-private.pem | Set-Content -Encoding utf8 fiscal-grant.local.json
+   ```
+
+3. Create a `route` JSON object with the register's five scope fields plus `providerId: "demo-provider"`, `merchantId: "demo-merchant"`, and `readerId: "demo-reader"`. Use that same route in the three configurations below. Key lists use entries of the form `{"id":"fiscal-root","file":"authority-public.pem"}` or `{"id":"demo-provider","file":"provider-public.pem"}`.
+
+   | Configuration | Fields |
+   | --- | --- |
+   | `provider.local.json` | `database: "provider.sqlite"`, `port: 4321`, `keyId: "demo-provider"`, `privateKey: "provider-private.pem"`, `routes: [route]`, `idempotencyMs: 30000` |
+   | `signer.local.json` | `database: "fiscal.sqlite"`, `port: 4322`, device UUID as `keyId`, `privateKey: "device-private.pem"`, `enrollment: "enrollment.local.json"`, `genesis: "genesis.local.json"`, and authority key list as `roots` |
+   | `payment-trust.local.json` | `routes: [route]`, `providerKeys`, and `fiscalRoots` |
+   | `payment.local.json` | `provider` with `url: "http://127.0.0.1:4321"`, `route`, `keys` containing the provider public key, and matching `idempotencyMs`. `fiscal` with `url: "http://127.0.0.1:4322"`, `enrollment: "enrollment.local.json"`, authority `roots`, and `grant: "fiscal-grant.local.json"`. |
+
+4. Set `OMNI_PAYMENT_TRUST_FILE=payment-trust.local.json` for the cloud and `OMNI_PAYMENT_FILE=payment.local.json` for the register. Configure distinct `OMNI_PROVIDER_TOKEN` and `OMNI_FISCAL_TOKEN` values of at least 24 characters in the fixture and register environments. Restart the cloud and send the `fiscal-enroll` operator action with `enrollment` and `genesis` containing the signed packet objects. Use the inventory CLI and the scoped operator actor from M3. Run each service in its own shell.
+
+   ```powershell
+   node --env-file=.env src/payment-fixture-cli.ts provider provider.local.json
+   node --env-file=.env src/payment-fixture-cli.ts signer signer.local.json
+   node --env-file=.env src/register-cli.ts retail.sqlite register.local.json
+   ```
+
+   Open or reuse the shift, scan `210001`, and select **Charge card reader**. The Blue mug fixture is 210¢ plus 10¢ tax. On success the printable receipt identifies the card rail, fiscal series, sequence, and epoch. Use **Sync next** to send the opening and the sale. The register retains its provider credential and the device retains its fiscal private key.
+
+### Operator recovery
+
+- **Unresolved capture.** Check the original payment from **Card payment recovery**. A signed webhook is recorded as delivery evidence. It prompts a read-only status check for an outstanding attempt. Status that cannot prove an outcome leaves the basket, quota, and shift cut fenced. The explicit **Check and retry same attempt** path first queries status, then replays the original operation only inside configured provider idempotency retention and with the worker lease available. For a definitive decline or nonexecution, the supervisor can authorize a replacement attempt with a reason code. The replacement retains the original quote and a link to the previous attempt.
+- **Captured funds.** Use `payment-inspect` with `intentId` to inspect the cloud case and its original attempt. `FISCAL_GRANT_REQUIRED` leaves a capture recoverable without charging again. To finish, issue a distinct grant for the required slot and replace the grant file. The register reads it on the next recovery. To refund instead, choose **Refund captured funds** and authorize with a supervisor PIN and a fixed reason code. The signer durably fences signing for that intent, the cloud reserves the linked refund, and the register records `REFUND_PENDING` before dispatch. If the response is lost, check the original attempt until authenticated status confirms refund. A pending refund leaves the case held. The cash return command rejects card receipts.
+- **Fiscal gap.** Use `fiscal-inspect` with `epochId` to see the canonical head and pending or forked slots. Recover the original payment and signed receipt on the terminal that owns the missing slot and replay its unchanged outbox bytes. Retrying either original can resume promotion of contiguous staged receipts. For an irreparable gap, the authority signs a new enrollment and a replacement genesis naming the old epoch. Submit the pair, then configure the new signer and grant. Late old-epoch receipts remain evidence under the retired epoch. Previously applied receipts retain their original vouchers.
+- **Storage.** Diagnostics samples filesystem free bytes, WAL size, and frames pending after a passive checkpoint. Pending frames can reflect an active writer or a long-lived reader. The fixture does not attribute reader age. M4-06 uses SQLite's page limit and a receipt-insert trigger to produce genuine result code 13 during local finalization. It checks transaction rollback and reopens the database to recover the exact signer proof and outbox event. Physical filesystem exhaustion requires a separate deployment test.
+
+### Simulator and accounting boundaries
+
+- The provider's fixture contract binds operation, merchant, reader, terminal generation, amount, currency, basket digest, and attempt. It persists authorization, capture, refund and test-injected settlement or reversal as separate facts. Within the configured idempotency window, it replays the original same-attempt effect. Definitive decline or nonexecution means the original attempt cannot later capture under this simulator contract. The adapter rejects fields outside its allowlist. Tests inject synthetic PAN-shaped, track, PIN block, verification code and reader-secret canaries and check HTTP errors, terminal logs, diagnostics, SQLite DB/WAL files, outbox and PostgreSQL artifacts.
+- At capture, the fixture debits CardClearing 220¢ and credits CapturedFunds 220¢. At fiscal application it debits CapturedFunds 220¢ and credits Revenue 210¢ and SalesTax 10¢. If an unapplied capture is refunded, it debits CapturedFunds and credits CardClearing for 220¢. Settlement and reversal remain separate audit facts in this fixture. It retains M3's cash-only return path and introduces no Cash posting or drawer pulse for card activity.
+- The fiscal signer records receipt bytes, head, and spent sequence together. Trusted time is an interval wholly within the grant and cannot move backward from the last signed interval. Recovery of an existing signature ignores later expiry. The interactive signer fixture uses the host clock as its interval source. The test clock injects missing, ambiguous and backward intervals. Device state is retained for replay and audit. A deployed device needs authenticated time, rollback-resistant head and spent state, protected keys, trusted enrollment and replacement authority, and jurisdiction-specific receipt certification. A copied or rolled-back software database does not provide those hardware guarantees.

@@ -11,6 +11,9 @@ import { SimulatedDevices } from '../src/retail-devices.ts';
 import type { Catalog } from '../src/retail-money.ts';
 import { parseRetail } from '../src/retail-protocol.ts';
 import { Terminal } from '../src/terminal.ts';
+import type { PaymentTrust } from '../src/payment-cloud.ts';
+import type { PaymentOptions } from '../src/payment-local.ts';
+import type { Scope } from '../src/protocol.ts';
 import { local, seed, testResources } from './fixture.ts';
 import type { TestDatabase } from './fixture.ts';
 
@@ -39,7 +42,7 @@ export async function stop(server: ReturnType<typeof createCloud>) {
   });
 }
 
-export async function retailFixture(t: TestContext, db: TestDatabase, counts = [3, 3, 3]) {
+export async function retailFixture(t: TestContext, db: TestDatabase, counts = [3, 3, 3], payments?: (scope:Scope)=>PaymentTrust) {
   const resources = await testResources(t);
   const a = await seed(db);
   const b = { ...a, terminalId: randomUUID(), token: randomBytes(32).toString('base64url') };
@@ -61,6 +64,7 @@ export async function retailFixture(t: TestContext, db: TestDatabase, counts = [
     operators: [{ tenantId: a.tenantId, token: operatorToken, actorId }],
     supervisors: [{ tenantId: a.tenantId, storeId: a.storeId, actorId, publicKey: supervisor.publicKey }],
     custodyKeys,
+    payments:payments?.(registers[0].scope),
   };
   const cloud = (observers?: Parameters<typeof createCloud>[3]) => createCloud(db.runtime, [a, b], resources.signer, observers, opts);
   const original = cloud();
@@ -91,12 +95,12 @@ export async function retailFixture(t: TestContext, db: TestDatabase, counts = [
     return signed;
   };
   const installed = new Set<number>();
-  const terminal = (index: 0 | 1, devices = new SimulatedDevices()) => {
+  const terminal = (index: 0 | 1, devices = new SimulatedDevices(), payment?:PaymentOptions) => {
     const target = registers[index];
     const connection = new Terminal(target.path);
     resources.dispose(() => { try { connection.close(); } catch {} });
     const register = connection.retail({ supervisor: { pin, actorId, signer: { id: 'fixture-supervisor', key: supervisor.privateKey } },
-      devices, deviceTimeoutMs: 20, cloud: { url, token: target.enrollment.token, keys } });
+      devices, payment, deviceTimeoutMs: 20, cloud: { url, token: target.enrollment.token, keys } });
     if (!installed.has(index)) { register.installCatalog(catalog, positions); installed.add(index); }
     return { connection, register, target, devices };
   };
@@ -107,7 +111,7 @@ export async function retailFixture(t: TestContext, db: TestDatabase, counts = [
       await op({ action: 'retail-enable', positionId: position.positionId, legacyDrained: true });
     }
   };
-  const child = (index: 0 | 1) => resources.spawn(registers[index].path, 'retail-child.ts');
+  const child = (index: 0 | 1, captureOutput=false) => resources.spawn(registers[index].path, 'retail-child.ts',captureOutput);
   const serve = (index: 0 | 1) => ({
     action: 'serve', port: 0, drawerId: randomUUID(), secret, pin, actorId,
     supervisorPem: supervisor.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
@@ -129,6 +133,7 @@ export function saved(path: string, id?: string) {
 }
 
 export function removeRetailLocalFixture(path: string) {
+  removePaymentLocalFixture(path);
   const db = new DatabaseSync(path);
   try {
     db.exec(`BEGIN; DROP TABLE retail_refunds; DROP TABLE retail_devices; DROP TABLE retail_closes;
@@ -139,6 +144,7 @@ export function removeRetailLocalFixture(path: string) {
 }
 
 export async function removeRetailCloudFixture(db: TestDatabase) {
+  await removePaymentCloudFixture(db);
   await db.fixture.query(`
     DROP VIEW omni.quota_inventory;
     ALTER VIEW omni.quota_inventory_v2 RENAME TO quota_inventory;
@@ -148,4 +154,18 @@ export async function removeRetailCloudFixture(db: TestDatabase) {
       omni.retail_positions,omni.retail_catalogs;
     DELETE FROM omni.migrations WHERE version=3;
   `);
+}
+
+export function removePaymentLocalFixture(path:string) {
+  const db=new DatabaseSync(path);
+  try {
+    db.exec(`BEGIN; DROP TABLE fiscal_local_receipts; DROP TABLE payment_incidents; DROP TABLE payment_evidence;
+      DROP TABLE payment_attempts; DROP TABLE payment_intents; PRAGMA user_version=3; COMMIT;`);
+  } finally { db.close(); }
+}
+
+export async function removePaymentCloudFixture(db:TestDatabase) {
+  await db.fixture.query(`DROP TABLE omni.fiscal_observations,omni.fiscal_grants,omni.fiscal_epochs,
+    omni.payment_postings,omni.payment_provider_events,omni.payment_cases;
+    DELETE FROM omni.migrations WHERE version=4;`);
 }

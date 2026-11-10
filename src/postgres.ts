@@ -43,7 +43,7 @@ export async function migrate(pool: Pool, runtimeRole: string): Promise<void> {
     await db.query('SELECT pg_advisory_xact_lock(71422101)');
     await db.query('CREATE SCHEMA IF NOT EXISTS omni');
     await db.query('CREATE TABLE IF NOT EXISTS omni.migrations (version integer PRIMARY KEY)');
-    const files = ['001-cloud.sql', '002-cloud.sql', '003-cloud.sql'];
+    const files = ['001-cloud.sql', '002-cloud.sql', '003-cloud.sql', '004-cloud.sql'];
     const { rows } = await db.query<{ version: number }>('SELECT version FROM omni.migrations');
     for (const [index, file] of files.entries()) {
       const version = index + 1;
@@ -72,6 +72,11 @@ export async function migrate(pool: Pool, runtimeRole: string): Promise<void> {
         omni.retail_stock_changes, omni.retail_counts, omni.retail_count_decisions TO ${role};
       GRANT UPDATE (closed, source_no) ON omni.retail_shifts TO ${role};
       GRANT UPDATE (state, payout_event_id, release_evidence) ON omni.retail_refunds TO ${role};
+      GRANT SELECT, INSERT ON omni.payment_cases, omni.payment_provider_events, omni.payment_postings,
+        omni.fiscal_epochs, omni.fiscal_grants, omni.fiscal_observations TO ${role};
+      GRANT UPDATE (state,refund_attempt,refund_reservation,sale_id) ON omni.payment_cases TO ${role};
+      GRANT UPDATE (head_sequence,head_digest,retired_by) ON omni.fiscal_epochs TO ${role};
+      GRANT UPDATE (status,reason) ON omni.fiscal_observations TO ${role};
     `);
     await db.query('COMMIT');
   } catch (error) {

@@ -40,10 +40,10 @@ export type Conflict = 'SALE_ID_CONFLICT' | 'SEQUENCE_CONFLICT';
 export type FinalDisposition = 'COMMITTED' | 'BACKORDER';
 export type Disposition = FinalDisposition | Conflict;
 export type VoucherEvent = Pick<SaleEvent, 'tenantId' | 'terminalId' | 'generation' | 'sequence' | 'saleId'> & {
-  version: 1 | 2 | 3;
+  version: 1 | 2 | 3 | 4;
 };
 export interface Ack {
-  version: 1 | 2 | 3;
+  version: 1 | 2 | 3 | 4;
   ackId: string;
   tenantId: string;
   terminalId: string;

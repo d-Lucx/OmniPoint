@@ -11,6 +11,8 @@ type Cart = LineMoney & { id: string; quote: Quote; quantity: number; discount: 
 type State = DiagnosticsState & {
   shift?: { shift_id: string; state: string }; catalog: Quote[]; cart: Cart[]; totals: LineMoney;
   pendingCount: number;
+  paymentsEnabled?:boolean;
+  payments?: Array<{intent_id:string;state:string;reason:string|null;fiscal_sequence:number|null;fiscal_epoch:string|null}>;
   close?: { event_id: string; counted_minor: number; expected_minor: number; variance_minor: number; delta_minor: number };
 };
 type Api = { data: unknown; state?: State; error?: string };
@@ -132,6 +134,37 @@ function App() {
   }
 
   const pending = state?.pendingCount ?? 0;
+  const paymentResult=(value:unknown)=>{
+    const result=value as {state:string;receipt?:Receipt;reason?:string};
+    if(result.receipt) setReceiptResult(result.receipt);
+    setMessage(result.reason??result.state);
+  };
+  const paymentPanel=state?.paymentsEnabled&&<section><h2>Card payment recovery</h2>
+    <p>Card entry stays on the enrolled reader. Check the original attempt before retrying.</p>
+    <ul>{state.payments?.map(item=><li key={item.intent_id}>
+      <strong>{item.state}</strong> · {item.reason??'Payment status recorded'} · {item.intent_id}
+      {item.fiscal_sequence!==null&&<div>Fiscal slot {item.fiscal_sequence} · Epoch {item.fiscal_epoch}</div>}
+      {!['FINALIZED','REFUNDED','DECLINED'].includes(item.state)&&<div className="row">
+        <button disabled={busy} onClick={()=>void run('card-recover',{id:item.intent_id},paymentResult)}>Check payment</button>
+        {['MAY_HAVE_SENT','REFUND_PENDING'].includes(item.state)&&<button disabled={busy}
+          onClick={()=>void run('card-retry',{id:item.intent_id},paymentResult)}>Check and retry same attempt</button>}
+      </div>}
+      {['CAPTURED','DECLINED'].includes(item.state)&&<form onSubmit={event=>{
+        const data=formData(event);
+        void run(item.state==='CAPTURED'?'card-refund':'card-replace',
+          {id:item.intent_id,reason:data.get('reason'),pin:data.get('pin')},paymentResult);
+      }}>
+        <label>Payment reason<select name="reason" required>
+          {item.state==='CAPTURED'?<><option value="FISCAL_UNAVAILABLE">Fiscal authority unavailable</option>
+            <option value="OPERATOR_CANCELLED">Operator cancelled</option></>:
+            <><option value="PROVIDER_DECLINED">Provider declined</option>
+              <option value="VERIFIED_NONEXECUTION">Verified nonexecution</option></>}
+        </select></label>
+        <label>Payment supervisor PIN<input type="password" name="pin" required /></label>
+        <button disabled={busy}>{item.state==='CAPTURED'?'Refund captured funds':'Authorize replacement attempt'}</button>
+      </form>}
+    </li>)}</ul>
+  </section>;
   let content: ReactNode;
   if (!state) {
     content = <section><h2>Cashier sign-in</h2><form onSubmit={event => {
@@ -142,8 +175,12 @@ function App() {
       <button disabled={busy}>Sign in</button>
     </form></section>;
   } else if (screen === 'diagnostics') {
-    content = <Diagnostics state={state} busy={busy} onSync={() => void run('sync', {}, data => setMessage(String(data)))}
-      onDispatch={() => void run('dispatch')} onCheck={(id, evidence, pin) => void run('check-device', { id, evidence, pin })} />;
+    content = <><Diagnostics state={state} busy={busy} onSync={() => void run('sync', {}, data => setMessage(String(data)))}
+      onDispatch={() => void run('dispatch')} onCheck={(id, evidence, pin) => void run('check-device', { id, evidence, pin })} />
+      <section><h2>Storage</h2><button disabled={busy} onClick={()=>void run('storage',{},data=>{
+        const info=data as {freeBytes:number|null;walBytes:number;pendingWalFrames:number};
+        setMessage(`Free bytes ${info.freeBytes??'unavailable'} · WAL bytes ${info.walBytes} · pending frames ${info.pendingWalFrames}`);
+      })}>Inspect storage</button></section>{paymentPanel}</>;
   } else {
     const shiftOpen = state.shift?.state === 'OPEN';
     const variants = state.catalog.filter(v => `${v.label} ${v.parentId} ${v.sku}`.toLowerCase().includes(search.toLowerCase()));
@@ -185,6 +222,8 @@ function App() {
           <form onSubmit={checkout}>
             <label>Cash tender in cents<input type="number" min="1" value={cash} onChange={e => setCash(e.target.value)} required /></label>
             <button disabled={busy || !state.cart.length}>Finalize cash sale</button>
+            {state.paymentsEnabled&&<button type="button" disabled={busy||!state.cart.length}
+              onClick={()=>identified('card-start',{},paymentResult)}>Charge card reader</button>}
           </form>
           <p>Change {usd(Math.max(0, Number(cash) - state.totals.totalMinor))}</p>
           {state.cart.length > 0 && <details><summary>Authorized line discount</summary>
@@ -219,6 +258,7 @@ function App() {
         {receipt && <><pre aria-label="Printable receipt">{receipt.printable}</pre>
           {receipt.lines && <ul aria-label="Receipt line IDs">{receipt.lines.map(line => <li key={line.id}>{line.sku} · {line.id}</li>)}</ul>}</>}
       </section>
+      {paymentPanel}
       {shiftOpen && <>
         <section><h2>Cash return</h2><p>Online supervisor authorization is required. An uncertain payout stays held for reconciliation.</p>
           <form onSubmit={e => finishForm(e, 'reserve-return', data => {

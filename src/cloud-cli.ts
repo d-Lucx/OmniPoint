@@ -1,10 +1,11 @@
 import { createPrivateKey, createPublicKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createCloud } from './cloud.ts';
+import { cloudPayments } from './payment-config.ts';
 import { poolFor } from './postgres.ts';
 
 const { OMNI_RUNTIME_URL, OMNI_ENROLLMENT_FILE, OMNI_SIGNING_KEY_FILE, OMNI_KEY_ID, OMNI_PORT,
-  OMNI_OPERATORS_FILE, OMNI_CUSTODY_PUBLIC_KEY_FILE, OMNI_CUSTODY_KEY_ID, OMNI_SUPERVISORS_FILE } = process.env;
+  OMNI_OPERATORS_FILE, OMNI_CUSTODY_PUBLIC_KEY_FILE, OMNI_CUSTODY_KEY_ID, OMNI_SUPERVISORS_FILE,OMNI_PAYMENT_TRUST_FILE } = process.env;
 if (!OMNI_RUNTIME_URL || !OMNI_ENROLLMENT_FILE || !OMNI_SIGNING_KEY_FILE || !OMNI_KEY_ID) {
   throw new Error('Set OMNI_RUNTIME_URL, OMNI_ENROLLMENT_FILE, OMNI_SIGNING_KEY_FILE and OMNI_KEY_ID');
 }
@@ -17,6 +18,7 @@ const server = createCloud(pool, JSON.parse(readFileSync(OMNI_ENROLLMENT_FILE, '
   id: OMNI_KEY_ID, key: createPrivateKey(readFileSync(OMNI_SIGNING_KEY_FILE)),
 }, undefined, {
   operators: OMNI_OPERATORS_FILE ? JSON.parse(readFileSync(OMNI_OPERATORS_FILE, 'utf8')) : [],
+  payments:OMNI_PAYMENT_TRUST_FILE?cloudPayments(OMNI_PAYMENT_TRUST_FILE):undefined,
   supervisors: OMNI_SUPERVISORS_FILE ? (JSON.parse(readFileSync(OMNI_SUPERVISORS_FILE, 'utf8')) as Array<{
     tenantId: string; storeId: string; actorId: string; publicKeyFile: string;
   }>).map(({ publicKeyFile, ...scope }) => ({ ...scope, publicKey: createPublicKey(readFileSync(publicKeyFile)) })) : [],

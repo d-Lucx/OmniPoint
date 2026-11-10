@@ -140,12 +140,16 @@ export class TerminalChild {
   private readonly process: ChildProcess;
   private readonly exited: Promise<[number | null, NodeJS.Signals | null]>;
   private readonly ready: Promise<Message>;
+  output = '';
 
-  constructor(path: string, entry = 'terminal-child.ts') {
+  constructor(path: string, entry = 'terminal-child.ts', captureOutput = false) {
     const { OMNI_TEST_ADMIN_URL: _admin, ...env } = process.env;
     this.process = fork(fileURLToPath(new URL(entry, import.meta.url)), [path], {
-      stdio: ['ignore', 'ignore', 'inherit', 'ipc'], serialization: 'advanced', execArgv: [], env,
+      stdio: ['ignore', captureOutput?'pipe':'ignore', captureOutput?'pipe':'inherit', 'ipc'], serialization: 'advanced', execArgv: [], env,
     });
+    for(const stream of [this.process.stdout,this.process.stderr]) {
+      stream?.on('data',(chunk:Buffer)=>{this.output=(this.output+chunk.toString('utf8')).slice(-65536);});
+    }
     this.exited = once(this.process, 'exit') as typeof this.exited;
     void this.exited.catch(() => {});
     this.ready = this.receive();
@@ -221,8 +225,8 @@ export async function testResources(t: TestContext) {
   return {
     dir, signer, publicKey, publicPem,
     dispose(work: () => void) { disposers.push(work); },
-    spawn(path: string, entry: string) {
-      const child = new TerminalChild(path, entry);
+    spawn(path: string, entry: string, captureOutput = false) {
+      const child = new TerminalChild(path, entry,captureOutput);
       children.push(child);
       return child;
     },

@@ -4,6 +4,10 @@ on: [push, pull_request]
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   durability:
     runs-on: ubuntu-24.04
@@ -40,6 +44,12 @@ jobs:
           git rev-parse HEAD | tee "$RUNNER_TEMP/omnipoint-evidence/commit.txt"
           node --version
           npm --version
+      - name: Verify pipeline failures remain failures
+        run: |
+          if (exit 23) | tee /dev/null; then
+            echo "Pipeline failure was masked" >&2
+            exit 1
+          fi
       - name: Run integration journeys and upgrades
         run: npm test 2>&1 | tee "$RUNNER_TEMP/omnipoint-evidence/integration.log"
       - name: Mount disposable storage fault filesystem

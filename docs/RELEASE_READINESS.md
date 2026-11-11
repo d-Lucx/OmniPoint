@@ -1,0 +1,135 @@
+# OmniPoint M1–M7 release readiness
+
+## Candidate
+
+Candidate branch: `release/m1-m7-rc`. Exact identity: `git rev-parse HEAD` (also retained in hosted artifacts). This packages the local M5–M7 foundation, including migrations 005–008, on published M4 commit `c91b1d1bdc4f185d85e5a23a8f85ba3e5512df73`. Parent design documents and prior history are preserved. No production deployment or main-branch replacement is included.
+
+Verification observations and remaining deployment requirements are recorded below. This is a review candidate for synthetic fixture workflows, not certified payments, fiscal hardware, tax or statutory integration.
+
+## Clean installation and reviewer walkthrough
+
+Use Node 24.22.1, npm, PostgreSQL 17.11 and Playwright Chromium (installed Edge on Windows). Clone tracked source without copying dependencies, configurations or build output:
+
+```sh
+git clone --branch release/m1-m7-rc https://github.com/d-Lucx/OmniPoint.git omnipoint-rc
+cd omnipoint-rc
+git rev-parse HEAD
+npm ci --ignore-scripts
+npm run check
+npx playwright install --with-deps chromium
+docker run --rm -d --name omnipoint-rc-pg -p 127.0.0.1:55432:5432 -e POSTGRES_USER=omnipoint_test_admin -e POSTGRES_PASSWORD=local-test-admin-only -e POSTGRES_DB=omnipoint_test postgres:17.11-bookworm
+docker exec omnipoint-rc-pg pg_isready -U omnipoint_test_admin -d omnipoint_test
+export OMNI_TEST_DISPOSABLE=1
+export OMNI_TEST_ADMIN_URL=postgresql://omnipoint_test_admin:local-test-admin-only@127.0.0.1:55432/omnipoint_test
+npm test
+npm run demo:m5
+npm run demo:m6
+npm run demo:m7
+git diff --check
+docker stop omnipoint-rc-pg
+```
+
+Wait for pg_isready to succeed. PowerShell uses npm.cmd and `$env:OMNI_TEST_DISPOSABLE='1'`, `$env:OMNI_TEST_ADMIN_URL='...'`. A dedicated native PostgreSQL cluster can replace Docker. Browser bundles are built by tests/demos. The harness requires loopback, explicit port, exact omnipoint_test database and disposable opt-in. It creates and drops only its own randomized databases/roles and temporary terminal directories. Never use a shared database.
+
+The following focused commands use normal HTTP/browser/process entry points and inspect exact persisted money, quantities and immutable artifacts. Repeated invocations are not additional coverage:
+
+- `node --test --test-name-pattern=M3-01 test/retail.test.ts`: offline browser sale, forced POS death, original receipt recovery, lost final response and verified ACK retirement.
+- `node --test --test-name-pattern=M4-01 test/payment.test.ts`: one 220-cent capture before POS death, one receipt/inventory effect, balanced clearing/revenue/tax, zero Cash/drawer effect. M4-03 separately exercises a held capture and authorized completion/refund.
+- `npm run demo:m5`: hospitality 211-cent gross splits 106/105 with 5 cents tax each; five-cent tip pool splits 3/2; stock consumed once. Approved mixed service invoice retains one commission.
+- `npm run demo:m6`: drawer/vault/deposit, supported variance deltas, both posting/close race orders, sealed March and successor April correction, exact independently verified report exports.
+- `npm run demo:m7`: six reimbursement artifact orders converge to two Cash debits and receivable credits totaling 1,000 cents each, zero residual receivable/fee/suspense; permanent revocations and statement forward matching preserve cash.
+- `node --test test/release-cli.test.ts`: actual terminal and governance CLI children recover/reprint, close/verify, approve/publish and retrieve original signed bytes.
+
+Manual use requires enrolled terminal/operator credentials, trusted public keys, explicit approvals and separate simulator authority configuration; README M3–M7 sections document these. Tests generate isolated keys and credentials. No generated secrets, terminal databases or bundles belong in Git.
+
+## Gate-to-entry-point mapping
+
+Run a listed file with node --test after build:register, or filter by gate using --test-name-pattern. The core suite contains 64 tests: 60 existing milestone tests, two release CLI regressions, and two treasury review regressions. The separate filesystem test requires an explicit disposable mount and skips visibly without one.
+
+| Gates | Normal boundary | Executable coverage |
+| --- | --- | --- |
+| M1-01–07 | terminal CLI/child; /v1/sales | test/milestone.test.ts: nine crash, commit failure, replay, ACK, RLS and receipt controls |
+| M2-01–06 | inventory authority; signed quota; sale ingest | test/quota.test.ts: both winner orders/race, issuance/expiry, crash, custody, shortfall resolution and upgrade |
+| M3-01–07 | register/browser/local API; /v3/register | test/retail.test.ts: offline crash journey, exact money, cash returns, blind close, devices, recount and upgrade |
+| M4-01–07 | independent provider/signer HTTP; payment/register | test/payment.test.ts: capture recovery/hold/refund, grants, chains/forks, page-limit FULL, canaries and upgrade |
+| M5-01–02 | module browser/local API; shared retail; booking authority | test/module-completion.test.ts: fractional settlement/tips, mixed work-order invoice/commission, shared backorder |
+| M5-03–04 | profiles; station display; fleet admission | test/modules.test.ts and module-completion.test.ts: profile/station/tenant scopes, cursor reload, held worker and another tenant live/recovery progress |
+| M5-05–06 | paired restore/replay; migration runners | module-completion.test.ts: fresh restore, exact voucher/hold, quarantine/gap fence and populated 005 upgrade |
+| M6-01–06 | /v6/governance; common ledger and CLI | test/governance.test.ts: custody, period races, signed bundle/backing restore, bridge, export race and 006 upgrade |
+| M7-01–07 | treasury governance; independent bank/agency HTTP | test/treasury.test.ts: uncertain execution, six permutations, sealed allocation, statements/amendments, revocation, reporting/restore and 007 upgrade |
+| Release CLI | actual terminal/governance child processes | test/release-cli.test.ts: offline exact receipt; verified seal/plan/export and historical retrieval |
+| Release storage | retained capture/signer; final retail recovery | test/storage-filesystem.test.ts: tmpfs ENOSPC, SQLite result 13, rollback, reopen and exact signed receipt/SYNCED |
+
+## Fresh and populated migration
+
+Cloud runner applies 001–008 transactionally under a schema advisory lock; terminal opening applies local 001–006. Manual migration: `node --env-file=.env src/migrate.ts` with dedicated owner/runtime roles per README. Re-running preserves records. Never rewrite applied migrations.
+
+Each test database is freshly migrated twice. Populated controls preserve:
+- M2-06/M3-07: v1/v2 receipt/event BLOBs, digests, vouchers and quota cutover fences.
+- M4-07: retail receipts and signed outcomes through payment/fiscal upgrade.
+- M5-06: populated 005 to 006 original local receipt and cloud voucher.
+- M6-06: populated 006 to 007 journals, immutable artifacts and captured-funds hold.
+- M7-07: populated 007 to 008 exact sale voucher/signature, seal bundle and published report; tenant denial and authorized successor posting.
+
+Privileged fixture schema-removal helpers are test-only, not deployment procedures.
+
+## Trust/write-boundary review
+
+This focused entry-point/database review is not a penetration test or compliance assessment.
+
+- Trusted tenant context is transaction-local on pooled connections; forced RLS and tenant-scoped foreign keys constrain runtime access. Migration/fixture roles are separate.
+- Legacy, retail/module, payment/refund and governed journals enter the common ledger through shared period locks and append-only database triggers. Close acquires the exclusive lock before a subsequent READ COMMITTED membership query. Runtime direct ledger mutation is denied. Exact replay returns the old result; first-seen sealed facts are held or authorized into an open successor.
+- ACK validation binds actual response bytes/status/disposition to the stored request digest and identity. A key ID only selects trusted keys. Provider, fiscal, custody, capability, seal, report, bank and agency artifacts have purpose/scope checks.
+- Register sessions are authenticated, loopback-bound and origin-checked. Browsers receive no cloud credentials/signing keys. Kitchen credentials constrain station/location; trusted code enforces capability and role.
+- Governance requires its own enrolled operator and signer. Ordinary terminal credentials cannot submit close/treasury actions. Independent fixtures use separate trust keys and authentication. In-process fault observers and privileged fixture SQL are absent from ordinary operator routes.
+- Durable MAY_HAVE_SENT precedes external I/O; unknown status holds original attempts. Stored fact replay does not dispatch a new operation.
+- Existing controls reject forged known-key signatures, cross-tenant scopes, conflicting exact-body evidence and synthetic sensitive-data canaries. Source/configuration inventory excludes generated private keys and local databases.
+
+## Recovery and storage boundaries
+
+M5–M7 restore uses **quiesced paired OmniPoint SQLite/PostgreSQL images** plus retained later verified images with known cuts/cursors/digests. It supplies actual backing data, verifies coverage before mutations and quarantines invalid replay without blocking unrelated work. This is not continuous production backup/PITR.
+
+M6 restores seal backing, successor linkage, exact vouchers and a captured-funds hold. M7 additionally verifies two seals, signed historical reports, canonical bank identities/aliases, permanent revocation tombstones, unresolved statement envelope and original external filing attempt. Missing/altered segments fence resumption. Original replay adds no journal; a supported successor adjustment posts once.
+
+Independent provider, signer, bank and agency SQLite stores remain available and restart against retained state. They are **not restored by the paired-image protocol**. Recovery queries original external identities. Catastrophic loss/rollback of these authorities requires separate backup and operator/status evidence. Block mutations/external dispatch until restored data and authoritative status are reconciled.
+
+M4-06 produces genuine SQLITE_FULL using a SQLite page limit. The release test separately fills a dedicated 32 MiB tmpfs with allocated bytes until ENOSPC, then attempts POS recovery after provider capture and signer commit. It checks SQLite code 13, rollback/no phantom receipt or quota spend, unchanged old outbox, reopen, original proof and durable SYNCED. It never fills the host filesystem.
+
+```sh
+storage_root="$(mktemp -d)"
+sudo mount -t tmpfs -o size=32m,mode=1777 tmpfs "$storage_root"
+export OMNI_STORAGE_FAULT_ROOT="$storage_root"
+npm run test:storage
+sudo umount "$storage_root"
+rmdir "$storage_root"
+```
+
+Use cleanup even on test failure. The test refuses non-Linux, non-tmpfs, missing disposable opt-in or capacity outside 8–64 MiB. tmpfs exhaustion does not prove physical media/controller or host-power-loss durability. Windows here has no administrator access or usable WSL/Docker; no constrained native Windows filesystem result is claimed.
+
+## Evidence and release decision
+
+Treasury review corrections add real PostgreSQL/HTTP regressions for revoking a reinstated attestation and moving a reimbursement through successive sealed corrections. The tests cover continuity promotion, reversal and reposting, delayed predecessors, duplicate delivery, legacy allocation heads, displaced surplus, stale proof rejection, and a correction back to the original fee. Active authority and reimbursement heads now retain their journal provenance through these transitions. Legacy heads are recovered from retained effects during normal processing. Historical seals remain verifiable.
+
+Windows review verification passed TypeScript, all 64 integration tests (zero failures or skips, 161.23 seconds), the focused ten-test treasury suite, and Git whitespace checks using the existing Node 24.22.1, SQLite 3.53.4, PostgreSQL 17.11, and Edge setup. Both new regressions failed against the original implementation before the fixes. Hosted verification for the resulting commit is discoverable using the exact-SHA commands below.
+
+Windows clean-clone evidence: candidate 09b95e030890454bd1328ea0390d6c2245acbe63 passed npm ci --ignore-scripts (empty dependency directory), npm run check, all 62 integration tests, demo:m5 (9), demo:m6 (6), demo:m7 (8) and git diff --check. Environment: Windows NT 10.0.26300.0, Node 24.22.1, npm 11.19.1, SQLite 3.53.4, native PostgreSQL 17.11 and installed Edge. Demos re-run existing tests and do not increase coverage counts. Native PostgreSQL came from the pinned @embedded-postgres/windows-x64@17.11.0-beta.19 package, in a separate loopback cluster; it was stopped after each run.
+
+Historical M4 [run 42914815853](https://github.com/d-Lucx/OmniPoint/actions/runs/42914815853) failed on c91b1d1 with asynchronous PostgreSQL teardown errors despite 37 passing assertions. It is not candidate success.
+
+Hosted Ubuntu 24.04 evidence: [run 42958675600](https://github.com/d-Lucx/OmniPoint/actions/runs/42958675600), commit 0c9201179da2e0c8fdc733f1b30fa5d30e916d5f, succeeded. Downloaded artifact verification-0c9201179da2e0c8fdc733f1b30fa5d30e916d5f contains commit.txt, integration.log (62 passed, zero failures/skips; 42.69 seconds) and storage.log (one passed, zero skips). It used Node 24.22.1, PostgreSQL 17.11-bookworm and Playwright Chromium. tmpfs: capacity 33,554,432 bytes, allocated filler 33,165,312 bytes; ENOSPC then SQLITE_FULL (13), transaction=false, one retained provider capture/signer result and durable SYNCED. Local copies of verification logs are retained outside the checkout in C:/Yan2_Projects/POS/.release-verify.
+
+Two release defects were demonstrated and fixed:
+1. pg Pool.end() resolves while idle client sockets are still closing. Immediate DROP DATABASE WITH (FORCE) raced PostgreSQL's FATAL response into completed tests on Linux. Cleanup now waits on actual backend exit with a bounded deadline, drops without FORCE and refuses destructive cleanup if connections remain. No blanket error suppression was added.
+2. The first candidate's tee pipeline masked npm test failure. [Run 42958263565](https://github.com/d-Lucx/OmniPoint/actions/runs/42958263565), commit 09b95e0, appeared successful but its retained integration log had nine errors (including failed-file summaries); **it is rejected as Linux suite evidence**. The workflow now explicitly selects bash with pipefail and tests a known failing pipeline before running tests. Corrected run 42958675600 has a genuinely clean integration log.
+
+The final candidate adds this report and a repeated populated 008 migration assertion to the tested fix. The delivery SHA is git rev-parse HEAD on release/m1-m7-rc. Final fresh-clone Windows and hosted runs are repeated for that exact SHA; obtain its immutable hosted record and logs with:
+
+```sh
+gh run list -R d-Lucx/OmniPoint --branch release/m1-m7-rc --commit "$(git rev-parse HEAD)" --json databaseId,headSha,status,conclusion,url
+gh run view RUN_ID -R d-Lucx/OmniPoint --log
+gh run download RUN_ID -R d-Lucx/OmniPoint --dir verification
+```
+
+Review decision: the synthetic M1–M7 candidate is eligible for review after its exact-SHA full-suite and storage run succeed. Inspect actual artifact counts, not only the workflow badge. No acceptance gap is substituted by an older green commit. This report's preceding SHA-specific results are retained separately from final-run discovery.
+
+Production requirements remain live payment/fiscal/bank/agency contracts, approved accounting/tax/jurisdiction mappings, real peripheral validation, hardware rollback resistance, backup retention/RPO/RTO, throughput sizing and host-power-loss testing. Synthetic approvals and mappings are fixture inputs.

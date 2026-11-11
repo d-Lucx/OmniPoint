@@ -1,8 +1,12 @@
-name: OmniPoint Milestones 1 through 4
+name: OmniPoint integration tests
 on: [push, pull_request]
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   durability:
@@ -34,4 +38,36 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npx playwright install --with-deps chromium
-      - run: npm test
+      - name: Record candidate and runtime
+        run: |
+          mkdir -p "$RUNNER_TEMP/omnipoint-evidence"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/omnipoint-evidence/commit.txt"
+          node --version
+          npm --version
+      - name: Verify pipeline failures remain failures
+        run: |
+          if (exit 23) | tee /dev/null; then
+            echo "Pipeline failure was masked" >&2
+            exit 1
+          fi
+      - name: Run integration journeys and upgrades
+        run: npm test 2>&1 | tee "$RUNNER_TEMP/omnipoint-evidence/integration.log"
+      - name: Mount disposable storage fault filesystem
+        run: |
+          storage_root="$RUNNER_TEMP/omnipoint-storage-full"
+          mkdir "$storage_root"
+          sudo mount -t tmpfs -o size=32m,mode=1777 tmpfs "$storage_root"
+          echo "OMNI_STORAGE_FAULT_ROOT=$storage_root" >> "$GITHUB_ENV"
+      - name: Verify real filesystem exhaustion and recovery
+        run: npm run test:storage 2>&1 | tee "$RUNNER_TEMP/omnipoint-evidence/storage.log"
+      - name: Unmount storage fixture
+        if: always()
+        run: |
+          storage_root="$RUNNER_TEMP/omnipoint-storage-full"
+          if mountpoint -q "$storage_root"; then sudo umount "$storage_root"; fi
+          if [ -d "$storage_root" ]; then rmdir "$storage_root"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-${{ github.sha }}
+          path: ${{ runner.temp }}/omnipoint-evidence

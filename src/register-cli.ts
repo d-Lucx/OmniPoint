@@ -15,7 +15,8 @@ const config = JSON.parse(readFileSync(configuration, 'utf8')) as {
   supervisor: { actorId: string; privateKeyFile: string };
 };
 const { OMNI_CASHIER_SECRET, OMNI_SUPERVISOR_PIN, OMNI_INGEST_URL, OMNI_TERMINAL_TOKEN, OMNI_PUBLIC_KEY_FILE,
-  OMNI_KEY_ID, OMNI_REGISTER_PORT,OMNI_PAYMENT_FILE,OMNI_PROVIDER_TOKEN,OMNI_FISCAL_TOKEN } = process.env;
+  OMNI_KEY_ID, OMNI_REGISTER_PORT,OMNI_PAYMENT_FILE,OMNI_PROVIDER_TOKEN,OMNI_FISCAL_TOKEN,
+  OMNI_KITCHEN_HOT_TOKEN, OMNI_KITCHEN_COLD_TOKEN } = process.env;
 if (!OMNI_CASHIER_SECRET || !OMNI_SUPERVISOR_PIN) throw new Error('Set cashier and supervisor credentials');
 const cloud = OMNI_INGEST_URL && OMNI_TERMINAL_TOKEN && OMNI_PUBLIC_KEY_FILE && OMNI_KEY_ID ?
   { url: OMNI_INGEST_URL, token: OMNI_TERMINAL_TOKEN,
@@ -30,7 +31,12 @@ const register = terminal.retail({
     signer: { id: 'local-supervisor', key: createPrivateKey(readFileSync(config.supervisor.privateKeyFile)) } },
 });
 register.installCatalog(config.catalog, config.positions);
-const server = createRegisterServer(register, { drawerId: config.drawerId, cashierSecret: OMNI_CASHIER_SECRET });
+if (OMNI_KITCHEN_HOT_TOKEN && OMNI_KITCHEN_HOT_TOKEN === OMNI_KITCHEN_COLD_TOKEN)
+  throw new Error('Kitchen stations require distinct credentials');
+const server = createRegisterServer(register, { drawerId: config.drawerId, cashierSecret: OMNI_CASHIER_SECRET, kitchen: {
+  ...(OMNI_KITCHEN_HOT_TOKEN ? { [OMNI_KITCHEN_HOT_TOKEN]: 'hot' } : {}),
+  ...(OMNI_KITCHEN_COLD_TOKEN ? { [OMNI_KITCHEN_COLD_TOKEN]: 'cold' } : {}),
+} });
 server.listen(Number(OMNI_REGISTER_PORT ?? 4317), '127.0.0.1', () => {
   console.log('OmniPoint register listening on http://127.0.0.1:' + (server.address() as { port: number }).port);
 });

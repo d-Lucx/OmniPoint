@@ -1,10 +1,11 @@
 import { createServer } from 'node:http';
 import type { KeyObject } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { inventoryAction } from './inventory-api.ts';
 import type { InventoryOptions } from './inventory-api.ts';
-import { ingestRetail } from './retail-cloud.ts';
+import { ingestModule, ingestRetail } from './retail-cloud.ts';
+import { parseModuleSale } from './module-sale.ts';
 import { retailInventoryAction } from './retail-inventory.ts';
 import { parseRetail, retailBodyLimit } from './retail-protocol.ts';
 import type { RetailEvent } from './retail-protocol.ts';
@@ -12,6 +13,11 @@ import { cardBodyLimit,parseCard } from './card-event.ts';
 import { fiscalOperator,ingestCard } from './fiscal-cloud.ts';
 import { inspectPayment,paymentAction } from './payment-cloud.ts';
 import { returnAction } from './retail-returns-cloud.ts';
+import { FleetAdmission, ModuleError, moduleAction } from './module-cloud.ts';
+import { signArtifact } from './authority.ts';
+import { governanceAction, isSealedPeriodError, retainLatePosting } from './governance-api.ts';
+import { ledgerWriter } from './period-close.ts';
+import { validateTreasuryTrust } from './treasury-protocol.ts';
 import { tenantTransaction } from './postgres.ts';
 import { admitQuota, decrementStock, InventoryError, lockStock, salePosition, saveOutcome, settleQuota } from './quota-cloud.ts';
 import {
@@ -26,6 +32,7 @@ type Claim = { body: Buffer } | { conflict: Conflict } | { staged: true };
 type Delivery = { bytes: Buffer; digest: string; event: SaleEvent };
 
 interface CloudObservers {
+  moduleWork?: (db: PoolClient, scope: Scope, action: unknown) => Promise<void>;
   cardReceived?: (bytes:Buffer)=>void;
   retailReceived?: (event: RetailEvent, bytes: Buffer) => void;
   received?: (delivery: Delivery) => void;
@@ -84,6 +91,7 @@ async function claimSale(pool: Pool, delivery: Delivery, custodyKeys: ReadonlyMa
       throw new Error('Missing committed claim');
     }
 
+    await ledgerWriter(db,tenantId);
     const stock = { tenantId, storeId, sku: e.line.sku };
     await lockStock(db, stock);
     const position = await salePosition(db, stock);
@@ -131,6 +139,16 @@ export function createCloud(
   pool: Pool, enrollments: readonly Enrollment[], signer: SigningKey, observers?: CloudObservers,
   inventory: InventoryOptions = {},
 ) {
+  if (inventory.treasury) validateTreasuryTrust(inventory.treasury);
+  async function holdLate(response:ServerResponse, tenant:string, path:string, bytes:Buffer) {
+    try {
+      await retainLatePosting(pool,tenant,path,bytes);
+      if (!response.destroyed) response.writeHead(202,{'content-type':'application/json'})
+        .end(jsonBytes({reason:'PERIOD_SEALED'}));
+    } catch {
+      if (!response.destroyed) response.writeHead(503).end();
+    }
+  }
   const enrolled = new Map<string, Scope>();
   for (const { token, ...scope } of enrollments) {
     if (!isScope(scope) || typeof token !== 'string' || !/^[A-Za-z0-9_-]{24,128}$/.test(token) || enrolled.has(token)) {
@@ -138,26 +156,31 @@ export function createCloud(
     }
     enrolled.set(token, scope);
   }
-  const operators = new Map<string, { tenantId: string; actorId?: string }>();
-  for (const { token, tenantId, actorId } of inventory.operators ?? []) {
+  const operators = new Map<string, { tenantId: string; actorId?: string; governance?: true }>();
+  for (const { token, tenantId, actorId, governance } of inventory.operators ?? []) {
     if (!isUuid(tenantId) || typeof token !== 'string' || !/^[A-Za-z0-9_-]{24,128}$/.test(token) ||
-        enrolled.has(token) || operators.has(token) || (actorId !== undefined && !isUuid(actorId))) {
+        enrolled.has(token) || operators.has(token) || (actorId !== undefined && !isUuid(actorId)) ||
+        (governance !== undefined && (governance !== true || !actorId))) {
       throw new Error('Invalid inventory operator enrollment');
     }
-    operators.set(token, { tenantId, actorId });
+    operators.set(token, { tenantId, actorId, governance });
   }
   const custodyKeys = inventory.custodyKeys ?? new Map<string, KeyObject>();
+  const fleet = pool.options.max >= 5 ? new FleetAdmission(pool.options.max) : undefined;
   if (!/^[A-Za-z0-9_-]{1,64}$/.test(signer.id) ||
       signer.key.type !== 'private' || signer.key.asymmetricKeyType !== 'ed25519') {
     throw new Error('Invalid signing key');
   }
   return createServer({ requestTimeout: 8000, headersTimeout: 5000 }, async (request, response) => {
-    const operatorRoute = request.url === '/v2/inventory';
+    const governanceRoute = request.url === '/v6/governance';
+    const operatorRoute = request.url === '/v2/inventory' || governanceRoute;
     const retail = request.url === '/v3/register';
     const refunds = request.url === '/v3/returns';
     const card = request.url === '/v4/register';
     const funds = request.url === '/v4/funds';
-    if (request.method !== 'POST' || (!operatorRoute && !retail && !refunds && !card && !funds && request.url !== '/v1/sales')) {
+    const modules = request.url === '/v5/modules';
+    const moduleSale = request.url === '/v5/register';
+    if (request.method !== 'POST' || (!operatorRoute && !retail && !refunds && !card && !funds && !modules && !moduleSale && request.url !== '/v1/sales')) {
       response.writeHead(404, { connection: 'close' }).end();
       return;
     }
@@ -168,11 +191,15 @@ export function createCloud(
       response.writeHead(401, { connection: 'close' }).end();
       return;
     }
+    if (governanceRoute && (!operator || !operator.governance || !inventory.governanceSigner)) {
+      response.writeHead(403, {connection:'close'}).end();
+      return;
+    }
     if (request.headers['content-type'] !== 'application/json' || request.headers['content-encoding']) {
       response.writeHead(415, { connection: 'close' }).end();
       return;
     }
-    const limit = card?cardBodyLimit:retail?retailBodyLimit:maxEventBytes;
+    const limit = card?cardBodyLimit:retail||moduleSale||governanceRoute?retailBodyLimit:maxEventBytes;
     if (Number(request.headers['content-length']) > limit) {
       response.writeHead(413, { connection: 'close' }).end();
       return;
@@ -193,7 +220,9 @@ export function createCloud(
         return;
       }
       try {
-        const result = input.action==='payment-inspect'&&inventory.payments&&operator.actorId ?
+        const result = governanceRoute ?
+          await governanceAction(pool,operator.tenantId,operator.actorId!,input,inventory.governanceSigner!,inventory.treasury) :
+          input.action==='payment-inspect'&&inventory.payments&&operator.actorId ?
           await inspectPayment(pool,operator.tenantId,input) :
           typeof input.action==='string'&&input.action.startsWith('fiscal-')&&inventory.payments&&operator.actorId ?
           await fiscalOperator(pool,operator.tenantId,input,inventory.payments) :
@@ -202,7 +231,8 @@ export function createCloud(
           await inventoryAction(pool, operator.tenantId, input, signer, custodyKeys);
         response.writeHead(200, { 'content-type': 'application/json' }).end(jsonBytes(result));
       } catch (error) {
-        const status = error instanceof InventoryError ? error.status :
+        if (governanceRoute) observers?.failed?.(error);
+        const status = isSealedPeriodError(error) ? 409 : error instanceof InventoryError ? error.status :
           (typeof error === 'object' && error && 'code' in error && error.code === '23505' ? 409 : 503);
         response.writeHead(status).end();
       }
@@ -210,6 +240,52 @@ export function createCloud(
     }
     if (!scope) {
       response.writeHead(401).end();
+      return;
+    }
+    if (modules) {
+      try {
+        const input = decode(bytes);
+        if (!fleet) throw new ModuleError(503, 'MODULE_CAPACITY_UNAVAILABLE');
+        const result = input.action === 'diagnostics' && Object.keys(input).length === 1 ?
+          { purpose: 'MODULE_DIAGNOSTICS', scope, ...fleet.inspect(scope.tenantId) } :
+          await fleet.run(scope.tenantId, input.action === 'book' ? 'booking' : 'background',
+            () => moduleAction(pool, scope, input, observers?.moduleWork));
+        response.writeHead(200, { 'content-type': 'application/json' })
+          .end(jsonBytes(signArtifact('module-v5', result, signer)));
+      } catch (error) {
+        const status = error instanceof ModuleError ? error.status : 'code' in Object(error) ? 503 : 422;
+        if (status === 429) response.setHeader('retry-after', '1');
+        response.writeHead(status, { 'content-type': 'application/json' })
+          .end(jsonBytes({ reason: error instanceof ModuleError ? error.message : 'MODULE_REQUEST_HELD' }));
+      }
+      return;
+    }
+    if (moduleSale) {
+      try {
+        const event = parseModuleSale(bytes);
+        if (!sameScope(event.sale,scope)) throw new ModuleError(403,'MODULE_SCOPE_REJECTED');
+        if (!fleet) throw new ModuleError(503,'MODULE_CAPACITY_UNAVAILABLE');
+        const result = await fleet.run(scope.tenantId, 'settlement', () =>
+          ingestModule(pool,event,bytes,signer,custodyKeys,inventory.supervisors ?? []));
+        if ('hold' in result) response.writeHead(202, {'content-type':'application/json'}).end(jsonBytes({reason:result.hold}));
+        else {
+          await observers?.beforeResponse?.(result,response);
+          sendVoucher(response,result);
+        }
+      } catch (error) {
+        observers?.failed?.(error);
+        if (isSealedPeriodError(error)) {
+          await holdLate(response,scope.tenantId,request.url!,bytes);
+          return;
+        }
+        const status = error instanceof ModuleError || error instanceof InventoryError ? error.status : 'code' in Object(error) ? 503 : 422;
+        if (!response.destroyed) {
+          if (status === 429) response.setHeader('retry-after','1');
+          response.writeHead(status, {'content-type':'application/json'}).end(jsonBytes({
+            reason: error instanceof ModuleError || error instanceof InventoryError ? error.message : 'MODULE_TENDER_HELD',
+          }));
+        }
+      }
       return;
     }
     if(card||funds) {
@@ -227,6 +303,10 @@ export function createCloud(
         }
       } catch(error) {
         observers?.failed?.(error);
+        if (isSealedPeriodError(error)) {
+          await holdLate(response,scope.tenantId,request.url!,bytes);
+          return;
+        }
         const status=error instanceof InventoryError?error.status:
           typeof error==='object'&&error&&'code' in error?503:422;
         if(!response.destroyed) response.writeHead(status,{'content-type':'application/json'})
@@ -264,6 +344,10 @@ export function createCloud(
         }
       } catch (error) {
         observers?.failed?.(error);
+        if (isSealedPeriodError(error)) {
+          await holdLate(response,scope.tenantId,request.url!,bytes);
+          return;
+        }
         const status = error instanceof InventoryError ? error.status :
           (typeof error === 'object' && error && 'code' in error && error.code === '23505' ? 409 : 503);
         if (!response.destroyed) response.writeHead(status, { 'content-type': 'application/json' })
@@ -303,6 +387,10 @@ export function createCloud(
       sendVoucher(response, voucher);
     } catch (error) {
       observers?.failed?.(error);
+      if (isSealedPeriodError(error)) {
+        await holdLate(response,scope.tenantId,request.url!,bytes);
+        return;
+      }
       if (!response.destroyed) response.writeHead(error instanceof InventoryError ? error.status : 503).end();
     }
   });

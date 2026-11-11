@@ -9,6 +9,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { TestContext } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { devItem } from '../src/development.ts';
@@ -38,7 +39,20 @@ export async function testDatabase() {
   const created: string[] = [];
   const cleanup = async () => {
     try {
-      if (created.includes(names.database)) await admin.query(`DROP DATABASE ${identifier(names.database)} WITH (FORCE)`);
+      if (created.includes(names.database)) {
+        // pg Pool.end() can resolve before its clients' sockets finish closing.
+        // FORCE races that goodbye with a server FATAL and leaks an async error
+        // into the completed test. Observe actual backend exit before dropping.
+        const deadline = Date.now() + 8000;
+        while (true) {
+          const { rows: [state] } = await admin.query<{ active: boolean }>(
+            'SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=$1) AS active', [names.database]);
+          if (!state.active) break;
+          if (Date.now() >= deadline) throw new Error('Fixture connections did not close; refusing forced database removal');
+          await delay(20);
+        }
+        await admin.query(`DROP DATABASE ${identifier(names.database)}`);
+      }
       for (const role of [names.runtime, names.owner]) {
         if (created.includes(role)) await admin.query(`DROP ROLE ${identifier(role)}`);
       }

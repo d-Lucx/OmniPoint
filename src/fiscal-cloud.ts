@@ -1,4 +1,5 @@
 import type { KeyObject } from 'node:crypto';
+import { ledgerWriter } from './period-close.ts';
 import type { Pool, PoolClient } from 'pg';
 import { exact } from './authority.ts';
 import { cardPrintable, parseCard } from './card-event.ts';
@@ -191,6 +192,7 @@ export async function ingestCard(
   const epochId = hint.epochId;
   const tenantId = scope.tenantId;
   const staged = await tenantTransaction(pool, tenantId, async (db) => {
+    await ledgerWriter(db,tenantId);
     await lock(db, tenantId, scope.terminalId);
     const a = await anchor(db, tenantId, epochId);
     const verified = verifyCard(bytes, scope, a, trust);
@@ -248,6 +250,7 @@ export async function ingestCard(
   // is a durable wake-up that can also be resumed by a successor or predecessor retry.
   for (let i = 0; i < 100; i++) {
     const advanced = await tenantTransaction(pool, tenantId, async (db) => {
+      await ledgerWriter(db,tenantId);
       await lock(db, tenantId, scope.terminalId);
       const a = await anchor(db, tenantId, epochId);
       if (a.retired_by) return false;

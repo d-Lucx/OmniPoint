@@ -17,6 +17,7 @@ export interface RegisterServerOptions {
   drawerId: string;
   bundle?: Uint8Array;
   checkoutBoundary?: (phase: 'before-commit' | 'after-commit') => Promise<void>;
+  kitchen?: Readonly<Record<string, 'hot' | 'cold'>>;
 }
 
 export function createRegisterServer(register: RetailRegister, options: RegisterServerOptions): Server {
@@ -27,10 +28,33 @@ export function createRegisterServer(register: RetailRegister, options: Register
   const bundle = options.bundle ?? readFileSync(new URL('../dist/register.js', import.meta.url));
   const css = readFileSync(new URL('ui/register.css', import.meta.url));
   const sessions = new Map<string, number>();
+  const kitchen = Object.entries(options.kitchen ?? {}).map(([token, station]) => {
+    if (!/^[A-Za-z0-9_-]{24,128}$/.test(token) || token === options.cashierSecret ||
+        (station !== 'hot' && station !== 'cold')) throw new Error('Invalid station enrollment');
+    return { token: Buffer.from(digest(Buffer.from(token)), 'hex'), station };
+  });
   let sequence = Promise.resolve();
 
   async function execute(input: Record<string, unknown>) {
     switch (input.action) {
+      case 'module-state': return register.modules.state();
+      case 'module-refresh': return register.modules.refresh();
+      case 'module-diagnostics': return register.modules.diagnostics();
+      case 'seat-table': return register.modules.seat(input.id, input.operationId, input.table, input.seats);
+      case 'dispatch-ticket': return register.modules.dispatch(input.id, input.operationId, input.revision,
+        input.seat, input.sku, input.modifier);
+      case 'split-checks': return register.modules.split(input.id,input.operationId,input.revision,input.split);
+      case 'work-intake': return register.modules.intake(input.id,input.operationId,input.booking,input.technician);
+      case 'work-estimate': return register.modules.estimate(input.id,input.operationId,input.revision,input.sku);
+      case 'work-authorize': return register.authorizeEstimate(input);
+      case 'work-start': return register.modules.startWork(input.id,input.operationId,input.revision);
+      case 'module-tender': {
+        const receipt = register.moduleTender(input);
+        await register.dispatchEvent(receipt.eventId);
+        return receipt;
+      }
+      case 'appointment-draft': return register.modules.draft(input.id, input.operationId, input.staff, input.start, input.minutes);
+      case 'appointment-book': return register.modules.book(input.id, input.operationId);
       case 'state': return;
       case 'storage': return register.storageStatus();
       case 'open': return register.openShift(input.id, options.drawerId, input.floatMinor);
@@ -96,7 +120,7 @@ export function createRegisterServer(register: RetailRegister, options: Register
     res.setHeader('x-content-type-options', 'nosniff');
     res.setHeader('cache-control', 'no-store');
     if (req.method === 'GET') {
-      if (req.url === '/') res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(shell);
+      if (req.url === '/' || req.url === '/kitchen') res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(shell);
       else if (req.url === '/register.js') res.writeHead(200, { 'content-type': 'text/javascript' }).end(bundle);
       else if (req.url === '/register.css') res.writeHead(200, { 'content-type': 'text/css' }).end(css);
       else res.writeHead(404).end();
@@ -114,7 +138,7 @@ export function createRegisterServer(register: RetailRegister, options: Register
       } catch { res.writeHead(422).end(); }
       return;
     }
-    if (req.method !== 'POST' || req.url !== '/api/register') {
+    if (req.method !== 'POST' || (req.url !== '/api/register' && req.url !== '/api/kitchen')) {
       res.writeHead(404).end();
       return;
     }
@@ -126,6 +150,29 @@ export function createRegisterServer(register: RetailRegister, options: Register
     let input;
     try { input = decode(await readBounded(req.iterator({ destroyOnReturn: false }), 8192)); }
     catch { res.writeHead(400, { connection: 'close' }).end(); return; }
+    if (req.url === '/api/kitchen') {
+      const token = /^Bearer ([A-Za-z0-9_-]{24,128})$/.exec(req.headers.authorization ?? '')?.[1];
+      const hash = token && Buffer.from(digest(Buffer.from(token)), 'hex');
+      const enrollment = hash && kitchen.find(entry => timingSafeEqual(entry.token, hash));
+      if (!enrollment) { res.writeHead(401).end(); return; }
+      try {
+        const { station } = enrollment;
+        let data: unknown;
+        if (input.action === 'feed') {
+          exact(input, ['action','cursor']);
+          data = register.modules.kitchenFeed(station, input.cursor);
+        } else {
+          exact(input, ['action','id','operationId','revision','ticketId']);
+          if (input.action !== 'ready' && input.action !== 'cancel') throw new Error('Unknown station action');
+          data = register.modules.kitchenUpdate(input.id, input.operationId, input.revision,
+            input.ticketId, station, input.action === 'ready' ? 'READY' : 'CANCELLED');
+        }
+        res.writeHead(200, { 'content-type': 'application/json' }).end(jsonBytes(data));
+      } catch {
+        res.writeHead(409, { 'content-type': 'application/json' }).end(jsonBytes({ error: 'Station action held' }));
+      }
+      return;
+    }
     if (input.action === 'login') {
       if (typeof input.secret !== 'string' || input.secret.length > 128 ||
           !timingSafeEqual(secret, Buffer.from(digest(Buffer.from(input.secret)), 'hex'))) {

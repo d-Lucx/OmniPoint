@@ -8,6 +8,9 @@ import { money } from './retail-money.ts';
 import { discountFacts, dropFacts, parseCatalog, revisionFacts, salePrintable } from './retail-protocol.ts';
 import type { RetailCount, RetailEvent, RetailSale, Supervisor } from './retail-protocol.ts';
 import { expectedDrawer, requireApproval, retailShift, verifyPayout } from './retail-returns-cloud.ts';
+import { moduleAccrual, modulePrintable, paymentLines, serviceFacts } from './module-sale.ts';
+import type { ModuleSale } from './module-sale.ts';
+import { ledgerWriter } from './period-close.ts';
 
 type LineOutcome = { lineId: string; fulfilled: number; backordered: number };
 type Allocation = { winner: string; fulfilled: boolean };
@@ -27,9 +30,10 @@ async function loadStored(db: PoolClient, e: RetailEvent, hash: string): Promise
 
 async function planSale(
   db: PoolClient, e: RetailSale, custodyKeys: ReadonlyMap<string, KeyObject>, supervisors: readonly Supervisor[],
+  priorShortfalls: ReadonlySet<string> = new Set(),
 ): Promise<SalePlan | undefined> {
   const positions = new Map<string, Awaited<ReturnType<typeof salePosition>>>();
-  for (const sku of [...new Set(e.lines.map(line => line.quote.sku))].sort()) {
+  for (const sku of [...new Set(e.lines.filter(line => line.units.length).map(line => line.quote.sku))].sort()) {
     const key = { tenantId: e.tenantId, storeId: e.storeId, sku };
     await lockStock(db, key);
     const position = await salePosition(db, key);
@@ -42,6 +46,10 @@ async function planSale(
   const results: LineOutcome[] = [];
   let custodyPending = false;
   for (const line of e.lines) {
+    if (line.quote.sku === 'LABOR' && !line.units.length) {
+      results.push({ lineId: line.id, fulfilled: 1, backordered: 0 });
+      continue;
+    }
     const { rows: [manifest] } = await db.query<{ body: Buffer }>(
       'SELECT body FROM omni.retail_catalogs WHERE tenant_id=$1 AND store_id=$2 AND version=$3',
       [e.tenantId, e.storeId, line.quote.catalogVersion],
@@ -54,7 +62,7 @@ async function planSale(
     }
     if (line.discount) requireApproval(e, line.discount.approval, 'discount',
       discountFacts(e.shiftId, line.id, line.quote, line.quantity, line.discount.amount, line.discount.reason), supervisors);
-    let fulfilled = 0;
+    let fulfilled = !line.units.length && !priorShortfalls.has(line.id) ? 1 : 0;
     for (const unit of line.units) {
       const args = [e.tenantId, unit.positionId, unit.sliceId];
       const evidence = await checkQuotaEvidence(db, e, unit, line.quote.sku, positions.get(line.quote.sku), custodyKeys, true);
@@ -79,18 +87,18 @@ async function cash(db: PoolClient, e: RetailEvent, amount: number, destination:
     [e.tenantId, e.saleId, e.shiftId, e.kind, amount, destination]);
 }
 
-async function postMoney(db: PoolClient, e: RetailEvent, basis: number, tax: number, direction: 1 | -1) {
-  for (const [account, minor] of [['Cash', basis + tax], ['Revenue', -basis], ['SalesTax', -tax]] as const) {
+async function postMoney(db: PoolClient, e: RetailEvent, basis: number, tax: number, direction: 1 | -1, tip = 0) {
+  for (const [account, minor] of [['Cash', basis + tax + tip], ['Revenue', -basis], ['SalesTax', -tax], ['TipsPayable', -tip]] as const) {
     if (minor !== 0) await db.query('INSERT INTO omni.retail_postings VALUES ($1,$2,$3,$4)',
       [e.tenantId, e.saleId, account, minor * direction]);
   }
 }
 
-async function writeSale(db: PoolClient, e: RetailSale, plan: SalePlan, card?:CardApplication) {
+async function writeSale(db: PoolClient, e: RetailSale, plan: SalePlan, card?:CardApplication, module?: ModuleSale) {
   await db.query('INSERT INTO omni.retail_receipts VALUES ($1,$2,$3,NULL,$4)',
-    [e.tenantId, e.receiptId, e.saleId, card?.printable ?? salePrintable(e)]);
+    [e.tenantId, e.receiptId, e.saleId, module ? modulePrintable(module) : card?.printable ?? salePrintable(e)]);
   for (const [index, line] of e.lines.entries()) {
-    const position = line.units[0].positionId;
+    const position = line.units[0]?.positionId ?? null;
     await db.query('INSERT INTO omni.retail_lines VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
       [e.tenantId, line.id, e.saleId, position, line.quote.sku, line.quantity, line.basisMinor, line.taxMinor, JSON.stringify(line)]);
     for (const unit of line.units) {
@@ -101,14 +109,59 @@ async function writeSale(db: PoolClient, e: RetailSale, plan: SalePlan, card?:Ca
       `, [e.tenantId, position, unit.grantId, unit.sliceId, line.id, award.fulfilled, award.winner]);
       if (award.fulfilled) await decrementStock(db, { tenantId: e.tenantId, storeId: e.storeId, sku: line.quote.sku });
     }
-    if (plan.results[index].backordered) await db.query('INSERT INTO omni.retail_shortfalls VALUES ($1,$2,$3)',
+    if (line.units.length && plan.results[index].backordered) await db.query('INSERT INTO omni.retail_shortfalls VALUES ($1,$2,$3)',
       [e.tenantId, line.id, plan.results[index].backordered]);
   }
   if(card) await card.apply(db);
   else {
     await cash(db, e, e.tenderMinor - e.changeMinor);
-    await postMoney(db, e, e.basisMinor, e.taxMinor, 1);
+    await postMoney(db, e, e.basisMinor, e.taxMinor, 1, module?.tip);
   }
+}
+
+async function validateModule(db: PoolClient, event: ModuleSale, supervisors: readonly Supervisor[]) {
+  const { plan, sale, check, before, paid, tip, tipBefore, claims } = event;
+  const { tenantId, storeId, terminalId, generation, cashierId } = sale;
+  await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 5002))', [tenantId + ':' + plan.id]);
+  const profile = await db.query<{ hospitality: boolean; services: boolean }>(
+    'SELECT hospitality,services FROM omni.capability_profiles WHERE tenant_id=$1 AND version=$2', [tenantId, plan.profile],
+  );
+  if (!profile.rows[0]?.[plan.workflow.kind]) throw new InventoryError('MODULE_PROFILE_NOT_AUTHORIZED', 403);
+  const pool = await db.query<{tips: string}>(`SELECT coalesce(sum((m.facts->>'tip')::integer),0) AS tips
+    FROM omni.module_tenders m JOIN omni.retail_events e USING (tenant_id,event_id)
+    WHERE e.tenant_id=$1 AND e.shift_id=$2`, [tenantId,sale.shiftId]);
+  if (Number(pool.rows[0].tips) !== tipBefore) throw new InventoryError('TIP_POOL_CUT_MISMATCH',409);
+  if (plan.workflow.kind === 'services') {
+    const work = plan.workflow;
+    requireApproval(sale, work.approval, 'service-estimate', serviceFacts(plan, work), supervisors);
+    if (work.booking) {
+      const booking = await db.query(`SELECT 1 FROM omni.service_appointments
+        WHERE tenant_id=$1 AND booking_id=$2 AND store_id=$3 AND staff=$4`,
+      [tenantId, work.booking, storeId, work.technician]);
+      if (!booking.rowCount) throw new InventoryError('SERVICE_BOOKING_REQUIRED', 422);
+    }
+  }
+  const hash = digest(jsonBytes([storeId,terminalId,generation,cashierId,plan]));
+  const { rows } = await db.query<{ check_no: number; paid_minor: number; plan_digest: string;
+    facts: { claimed: string[]; stock?: {source:string; lineId:string; backordered:number}[] } }>(`SELECT check_no,paid_minor,plan_digest,facts FROM omni.module_tenders
+    WHERE tenant_id=$1 AND aggregate_id=$2`, [tenantId, plan.id]);
+  if (rows.some(row => row.plan_digest !== hash) ||
+      rows.filter(row => row.check_no === check).reduce((sum,row) => sum + row.paid_minor, 0) !== before)
+    throw new InventoryError('MODULE_CHECK_CONFLICT', 409);
+  const prior = new Set(rows.flatMap(row => row.facts.claimed));
+  const lines = paymentLines(plan, check, before, paid);
+  const expected = lines.filter(line => line.source.item !== 'labor' && !prior.has(line.source.id));
+  if (expected.length !== claims.length || expected.some(line => !claims.some(claim => claim.source === line.source.id)))
+    throw new InventoryError('MODULE_PHYSICAL_CLAIM_REQUIRED', 422);
+  const owners = new Map(rows.flatMap(row => row.facts.stock ?? []).map(stock => [stock.source,stock]));
+  const priorShortfalls = new Set(lines.flatMap((line,index) =>
+    owners.get(line.source.id)?.backordered ? [sale.lines[index].id] : []));
+  return { hash, priorShortfalls, stock: lines.flatMap((line,index) =>
+    sale.lines[index].units.length ? [{source:line.source.id,lineId:sale.lines[index].id,index}] : []),
+  facts: { tip, claimed: claims.map(claim => claim.source),
+    allocations: lines.map(({ source, ...line },index) => ({
+      source:source.id, ...line, stockLine:owners.get(source.id)?.lineId ?? (sale.lines[index].units.length ? sale.lines[index].id : null),
+    })), ...moduleAccrual(event) } };
 }
 
 async function writeCount(db: PoolClient, e: RetailCount, supervisors: readonly Supervisor[]) {
@@ -133,7 +186,9 @@ async function writeCount(db: PoolClient, e: RetailCount, supervisors: readonly 
 export async function admitRetail(
   db: PoolClient, e: RetailEvent, bytes: Buffer, custodyKeys: ReadonlyMap<string, KeyObject>, supervisors: readonly Supervisor[],
   card?:CardApplication,
+  module?:ModuleSale,
 ): Promise<Admission> {
+  await ledgerWriter(db,e.tenantId);
   const hash = digest(bytes);
     const known = await loadStored(db, e, hash);
     if (known) return known;
@@ -151,7 +206,8 @@ export async function admitRetail(
     if (e.sequence <= shift.source_no) return { conflict: 'SEQUENCE_CONFLICT' };
     if (e.sequence !== shift.source_no + 1) return { hold: 'SHIFT_SEQUENCE_GAP' };
     if (shift.closed !== (e.kind === 'REVISION')) throw new InventoryError('SHIFT_STATE_REJECTED', 409);
-    const plan = e.kind === 'SALE' ? await planSale(db, e, custodyKeys, supervisors) : undefined;
+    const moduleRecord = module && await validateModule(db, module, supervisors);
+    const plan = e.kind === 'SALE' ? await planSale(db, e, custodyKeys, supervisors, moduleRecord?.priorShortfalls) : undefined;
     if (e.kind === 'SALE' && !plan) return { hold: 'CUSTODY_RECEIPT_MISSING' };
     const refund = e.kind === 'RETURN' ? await verifyPayout(db, e, supervisors) : undefined;
     if (e.kind === 'DROP') {
@@ -161,13 +217,20 @@ export async function admitRetail(
         [e.tenantId, e.shiftId]);
       if (pending.rowCount) throw new InventoryError('PENDING_PAYOUT_BLOCKS_DROP', 409);
     }
-    const ack = ackBody(card?{...e,version:4}:e, hash, plan?.results.some(line => line.backordered) ? 'BACKORDER' : 'COMMITTED');
+    const ack = ackBody(module ? {...e,version:5} : card ? {...e,version:4} : e, hash,
+      plan?.results.some(line => line.backordered) ? 'BACKORDER' : 'COMMITTED');
     const body = jsonBytes(plan ? { ...ack, lines: plan.results } : ack);
     await db.query('INSERT INTO omni.retail_events VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
       [e.tenantId, e.saleId, e.shiftId, e.sequence, e.kind, bytes, hash, body]);
     switch (e.kind) {
       case 'OPEN': await cash(db, e, e.floatMinor); break;
-      case 'SALE': await writeSale(db, e, plan!,card); break;
+      case 'SALE':
+        await writeSale(db, e, plan!, card, module);
+        if (module && moduleRecord) await db.query('INSERT INTO omni.module_tenders VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+          [e.tenantId,e.saleId,module.plan.id,module.check,module.before,module.paid,moduleRecord.hash,
+            JSON.stringify({...moduleRecord.facts,stock:moduleRecord.stock.map(({index,...row}) =>
+              ({...row,backordered:plan!.results[index].backordered}))})]);
+        break;
       case 'DROP': await cash(db, e, -e.amountMinor, e.destinationId); break;
       case 'RETURN': {
         await db.query('INSERT INTO omni.retail_receipts VALUES ($1,$2,$3,$4,$5)',
@@ -185,6 +248,16 @@ export async function admitRetail(
     await db.query('UPDATE omni.retail_shifts SET source_no=$3,closed=$4 WHERE tenant_id=$1 AND shift_id=$2',
       [e.tenantId, e.shiftId, e.sequence, e.kind === 'CLOSE' || e.kind === 'REVISION']);
     return { body };
+}
+
+export async function ingestModule(
+  pool: Pool, event: ModuleSale, bytes: Buffer, signer: SigningKey,
+  custodyKeys: ReadonlyMap<string, KeyObject>, supervisors: readonly Supervisor[],
+) {
+  const { sale } = event;
+  const result = await tenantTransaction(pool, sale.tenantId,
+    db => admitRetail(db, sale, bytes, custodyKeys, supervisors, undefined, event));
+  return voucherRetail(pool, {...sale, version:5}, bytes, signer, result);
 }
 
 export async function ingestRetail(

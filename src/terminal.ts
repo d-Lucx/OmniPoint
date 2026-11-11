@@ -56,7 +56,7 @@ export class Terminal {
       }
       this.write(() => {
         const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-        const files = ['001-local.sql', '002-local.sql', '003-local.sql', '004-local.sql'];
+        const files = ['001-local.sql', '002-local.sql', '003-local.sql', '004-local.sql', '005-local.sql', '006-local.sql'];
         if (!Number.isInteger(version) || version < 0 || version > files.length) throw new Error('Unsupported local schema');
         for (const [index, file] of files.entries()) {
           if (index < version) continue;
@@ -253,17 +253,17 @@ export class Terminal {
         headers: { authorization: `Bearer ${config.token}`, 'content-type': 'application/json' },
         body: bytes,
       });
-      if (response.status === 202 && event.version === 2) {
-        await response.body?.cancel();
-        result = 'HTTP_202';
-        throw new Error('Staged response is retryable');
-      }
       result = 'ACK_REJECTED';
       if (response.headers.has('content-encoding')) {
         await response.body?.cancel();
         throw new Error('Encoded acknowledgment');
       }
       const body = response.body ? await readBounded(response.body, maxAckBytes) : Buffer.alloc(0);
+      if (response.status === 202) {
+        if (event.version === 2) result = 'HTTP_202';
+        if (body.length && JSON.parse(body.toString()).reason === 'PERIOD_SEALED') result = 'PERIOD_SEALED';
+        throw new Error('Staged response is retryable');
+      }
       const ack = verifyVoucher(response.status, body, response.headers, config.keys, event, row.digest);
       ackId = ack.ackId;
       result = ack.disposition;

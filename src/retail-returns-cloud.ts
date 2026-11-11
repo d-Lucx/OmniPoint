@@ -86,6 +86,7 @@ async function reserve(db: PoolClient, scope: Scope, input: Record<string, unkno
     JOIN omni.retail_shifts s USING (tenant_id,shift_id)
     JOIN omni.retail_vouchers v USING (tenant_id,event_id)
     WHERE l.tenant_id=$1 AND l.line_id=$2 AND r.receipt_id=$3 AND s.store_id=$4 AND e.kind='SALE'
+      AND NOT EXISTS (SELECT 1 FROM omni.module_tenders m WHERE (m.tenant_id,m.event_id)=(e.tenant_id,e.event_id))
   `, [scope.tenantId, request.lineId, request.receiptId, scope.storeId]);
   if (!original) throw new InventoryError('ORIGINAL_RECEIPT_NOT_SYNCED_OR_IN_SCOPE', 409);
   const card = await db.query(`

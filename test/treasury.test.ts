@@ -485,6 +485,7 @@ test('M7-07 populated 007 upgrade preserves exact vouchers, seals and reports, a
   const plan=report(closed.id);await h.go(plan);
   const published=await h.go({action:'report-publish',plan:plan.id,id:id()});
   await db.upgrade();
+  await db.upgrade(); // Re-running against populated 008 must preserve the same artifacts.
   const replay=await post(saleUrl,h.enrollment.token,sale);
   assert.deepEqual(replay.bytes,voucher.bytes);
   assert.equal(replay.headers.get('omni-signature'),voucher.headers.get('omni-signature'));

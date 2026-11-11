@@ -4,7 +4,7 @@
 
 Candidate branch: `release/m1-m7-rc`. Exact identity: `git rev-parse HEAD` (also retained in hosted artifacts). This packages the local M5–M7 foundation, including migrations 005–008, on published M4 commit `c91b1d1bdc4f185d85e5a23a8f85ba3e5512df73`. Parent design documents and prior history are preserved. No production deployment or main-branch replacement is included.
 
-Verification is in progress; final observations are recorded below. This is a review candidate for synthetic fixture workflows, not certified payments, fiscal hardware, tax or statutory integration.
+Verification observations and remaining deployment requirements are recorded below. This is a review candidate for synthetic fixture workflows, not certified payments, fiscal hardware, tax or statutory integration.
 
 ## Clean installation and reviewer walkthrough
 
@@ -108,10 +108,24 @@ Use cleanup even on test failure. The test refuses non-Linux, non-tmpfs, missing
 
 ## Evidence and release decision
 
-Local: Windows, Node 24.22.1, npm 11.19.1, dedicated native PostgreSQL 17.11. Type checking and both new CLI tests passed before snapshot. Clean-checkout/full evidence pending.
+Windows clean-clone evidence: candidate 09b95e030890454bd1328ea0390d6c2245acbe63 passed npm ci --ignore-scripts (empty dependency directory), npm run check, all 62 integration tests, demo:m5 (9), demo:m6 (6), demo:m7 (8) and git diff --check. Environment: Windows NT 10.0.26300.0, Node 24.22.1, npm 11.19.1, SQLite 3.53.4, native PostgreSQL 17.11 and installed Edge. Demos re-run existing tests and do not increase coverage counts. Native PostgreSQL came from the pinned @embedded-postgres/windows-x64@17.11.0-beta.19 package, in a separate loopback cluster; it was stopped after each run.
 
 Historical M4 [run 42914815853](https://github.com/d-Lucx/OmniPoint/actions/runs/42914815853) failed on c91b1d1 with asynchronous PostgreSQL teardown errors despite 37 passing assertions. It is not candidate success.
 
-Candidate hosted Ubuntu and filesystem results pending. CI installs pinned dependencies, Chromium and PostgreSQL, runs every core suite/process-kill journey and the bounded tmpfs test, and uploads SHA/log artifacts on success or failure. Final evidence will name tested commits and runs.
+Hosted Ubuntu 24.04 evidence: [run 42958675600](https://github.com/d-Lucx/OmniPoint/actions/runs/42958675600), commit 0c9201179da2e0c8fdc733f1b30fa5d30e916d5f, succeeded. Downloaded artifact verification-0c9201179da2e0c8fdc733f1b30fa5d30e916d5f contains commit.txt, integration.log (62 passed, zero failures/skips; 42.69 seconds) and storage.log (one passed, zero skips). It used Node 24.22.1, PostgreSQL 17.11-bookworm and Playwright Chromium. tmpfs: capacity 33,554,432 bytes, allocated filler 33,165,312 bytes; ENOSPC then SQLITE_FULL (13), transaction=false, one retained provider capture/signer result and durable SYNCED. Local copies of verification logs are retained outside the checkout in C:/Yan2_Projects/POS/.release-verify.
+
+Two release defects were demonstrated and fixed:
+1. pg Pool.end() resolves while idle client sockets are still closing. Immediate DROP DATABASE WITH (FORCE) raced PostgreSQL's FATAL response into completed tests on Linux. Cleanup now waits on actual backend exit with a bounded deadline, drops without FORCE and refuses destructive cleanup if connections remain. No blanket error suppression was added.
+2. The first candidate's tee pipeline masked npm test failure. [Run 42958263565](https://github.com/d-Lucx/OmniPoint/actions/runs/42958263565), commit 09b95e0, appeared successful but its retained integration log had nine errors (including failed-file summaries); **it is rejected as Linux suite evidence**. The workflow now explicitly selects bash with pipefail and tests a known failing pipeline before running tests. Corrected run 42958675600 has a genuinely clean integration log.
+
+The final candidate adds this report and a repeated populated 008 migration assertion to the tested fix. The delivery SHA is git rev-parse HEAD on release/m1-m7-rc. Final fresh-clone Windows and hosted runs are repeated for that exact SHA; obtain its immutable hosted record and logs with:
+
+```sh
+gh run list -R d-Lucx/OmniPoint --branch release/m1-m7-rc --commit "$(git rev-parse HEAD)" --json databaseId,headSha,status,conclusion,url
+gh run view RUN_ID -R d-Lucx/OmniPoint --log
+gh run download RUN_ID -R d-Lucx/OmniPoint --dir verification
+```
+
+Review decision: the synthetic M1–M7 candidate is eligible for review after its exact-SHA full-suite and storage run succeed. Inspect actual artifact counts, not only the workflow badge. No acceptance gap is substituted by an older green commit. This report's preceding SHA-specific results are retained separately from final-run discovery.
 
 Production requirements remain live payment/fiscal/bank/agency contracts, approved accounting/tax/jurisdiction mappings, real peripheral validation, hardware rollback resistance, backup retention/RPO/RTO, throughput sizing and host-power-loss testing. Synthetic approvals and mappings are fixture inputs.

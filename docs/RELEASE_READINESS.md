@@ -44,7 +44,7 @@ Manual use requires enrolled terminal/operator credentials, trusted public keys,
 
 ## Gate-to-entry-point mapping
 
-Run a listed file with node --test after build:register, or filter by gate using --test-name-pattern. The core suite contains 62 tests: 60 existing milestone tests and two release CLI regressions. The separate filesystem test requires an explicit disposable mount and skips visibly without one.
+Run a listed file with node --test after build:register, or filter by gate using --test-name-pattern. The core suite contains 64 tests: 60 existing milestone tests, two release CLI regressions, and two treasury review regressions. The separate filesystem test requires an explicit disposable mount and skips visibly without one.
 
 | Gates | Normal boundary | Executable coverage |
 | --- | --- | --- |
@@ -107,6 +107,10 @@ rmdir "$storage_root"
 Use cleanup even on test failure. The test refuses non-Linux, non-tmpfs, missing disposable opt-in or capacity outside 8–64 MiB. tmpfs exhaustion does not prove physical media/controller or host-power-loss durability. Windows here has no administrator access or usable WSL/Docker; no constrained native Windows filesystem result is claimed.
 
 ## Evidence and release decision
+
+Treasury review corrections add real PostgreSQL/HTTP regressions for revoking a reinstated attestation and moving a reimbursement through successive sealed corrections. The tests cover continuity promotion, reversal and reposting, delayed predecessors, duplicate delivery, legacy allocation heads, displaced surplus, stale proof rejection, and a correction back to the original fee. Active authority and reimbursement heads now retain their journal provenance through these transitions. Legacy heads are recovered from retained effects during normal processing. Historical seals remain verifiable.
+
+Windows review verification passed TypeScript, all 64 integration tests (zero failures or skips, 161.23 seconds), the focused ten-test treasury suite, and Git whitespace checks using the existing Node 24.22.1, SQLite 3.53.4, PostgreSQL 17.11, and Edge setup. Both new regressions failed against the original implementation before the fixes. Hosted verification for the resulting commit is discoverable using the exact-SHA commands below.
 
 Windows clean-clone evidence: candidate 09b95e030890454bd1328ea0390d6c2245acbe63 passed npm ci --ignore-scripts (empty dependency directory), npm run check, all 62 integration tests, demo:m5 (9), demo:m6 (6), demo:m7 (8) and git diff --check. Environment: Windows NT 10.0.26300.0, Node 24.22.1, npm 11.19.1, SQLite 3.53.4, native PostgreSQL 17.11 and installed Edge. Demos re-run existing tests and do not increase coverage counts. Native PostgreSQL came from the pinned @embedded-postgres/windows-x64@17.11.0-beta.19 package, in a separate loopback cluster; it was stopped after each run.
 

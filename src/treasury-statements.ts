@@ -126,6 +126,17 @@ export async function statements(ctx:Treasury) {
   }
 }
 
+async function promote(ctx:Treasury,original:string,successor:Fact,binding:Pair,mode:string) {
+  await ctx.set('attestation',original,0,'REINSTATED',{successor:successor.id,mode});
+  if (await ctx.position('attestation',successor.id)) return;
+  const credit=await ctx.position('credit',binding.credit), envelope=await ctx.position('envelope',binding.envelope);
+  if (credit?.remaining===0 && envelope?.remaining===0 && credit.facts.matched===original && envelope.facts.matched===original) {
+    await ctx.set('credit',credit.id,0,credit.state,{...credit.facts,matched:successor.id});
+    await ctx.set('envelope',envelope.id,0,envelope.state,{...envelope.facts,matched:successor.id});
+  }
+  await ctx.set('attestation',successor.id,0,'ACTIVE',{cut:successor.cut});
+}
+
 export async function attestations(ctx:Treasury) {
   const items=(await ctx.facts('ATTEST','REVOKE','REINSTATE')).map(row=>row.fact);
   const originals=items.filter(fact=>fact.kind==='ATTEST');
@@ -135,38 +146,50 @@ export async function attestations(ctx:Treasury) {
     const originalId=uuid(revoke.data.original), binding=pair(revoke.data);
     const old=await ctx.position('tombstone',originalId);
     if (old && old.facts.revocation!==revoke.id) return fail('REVOCATION_IDENTITY_CONFLICT',409);
-    const original=originals.find(item=>item.id===originalId);
+    const original=items.find(item=>item.id===originalId && (item.kind==='ATTEST' || item.kind==='REINSTATE'));
     if (original && (revoke.lineage!==original.lineage || revoke.cut<=original.cut || !identical(binding,pair(original.data))))
       return fail('REVOCATION_LINEAGE_REJECTED');
     if (!old) await ctx.set('tombstone',originalId,0,'PERMANENT',{revocation:revoke.id,cut:revoke.cut,...binding});
     const credit=await ctx.position('credit',binding.credit);
     const envelope=await ctx.position('envelope',binding.envelope);
-    const active=await ctx.effect('attest:'+originalId);
+    const active=await ctx.effect('attest:'+originalId) ?? await ctx.effect('reinstate:'+originalId) ??
+      await ctx.effect('authority-only:'+originalId);
+    const journal=active?.journal ?? (typeof active?.facts.journal==='string' ? active.facts.journal : null);
     const inverse=await ctx.effect('revoke:'+originalId);
     const promoted=await ctx.position('attestation',originalId);
-    if (promoted?.state==='REINSTATED') continue;
+    if (promoted?.state==='REINSTATED') {
+      const successor=successors.find(item=>item.id===promoted.facts.successor);
+      if (successor && !await ctx.position('attestation',successor.id))
+        await promote(ctx,originalId,successor,binding,String(promoted.facts.mode));
+      continue;
+    }
     const replacements=successors.filter(item=>item.data.original===originalId && item.data.revocation===revoke.id &&
       item.lineage===revoke.lineage && item.cut>revoke.cut && identical(binding,pair(item.data)));
     if (replacements.length>1) {
       await ctx.set('incident',originalId,0,'REINSTATEMENT_CONFLICT',{candidates:replacements.map(item=>item.id)});
     }
-    const successor=replacements.length===1 ? replacements[0] : undefined;
-    if (successor && original && active?.journal && !inverse && credit?.facts.matched===originalId &&
+    const candidate=replacements.length===1 ? replacements[0] : undefined;
+    const successor=candidate && !revocations.some(item=>item.data.original===candidate.id) ? candidate : undefined;
+    if (successor && original && journal && !inverse && credit?.facts.matched===originalId &&
         envelope?.facts.matched===originalId && credit.remaining===0 && envelope.remaining===0) {
-      await ctx.record('authority-only:'+successor.id,successor.id,null,{original:originalId,revocation:revoke.id,journal:active.journal});
-      await ctx.set('attestation',originalId,0,'REINSTATED',{successor:successor.id,mode:'CONTINUITY'});
+      await ctx.record('authority-only:'+successor.id,successor.id,journal,{original:originalId,revocation:revoke.id,journal});
+      await promote(ctx,originalId,successor,binding,'CONTINUITY');
       continue;
     }
-    if (active && !inverse && credit && envelope) {
+    if (journal && !inverse && credit && envelope) {
+      if (credit.remaining!==0 || envelope.remaining!==0 ||
+          credit.facts.matched!==originalId || envelope.facts.matched!==originalId)
+        return fail('REVOCATION_ACTIVE_BINDING_MISMATCH',409);
       if (!await ctx.journal('revoke:'+originalId,revoke,'OutboundClearing','InboundReturnSuspense',binding.minor,
-        {original:originalId,reference:'adjustment:'+active.journal+':InboundReturnSuspense'})) continue;
+        {original:originalId,reference:'adjustment:'+journal+':InboundReturnSuspense'})) continue;
       await ctx.set('envelope',envelope.id,envelope.remaining+binding.minor,'AMBIGUOUS',envelope.facts);
       await ctx.set('credit',credit.id,credit.remaining+binding.minor,'REVOKED_HELD',credit.facts);
     } else if (credit?.remaining && credit.state==='AVAILABLE') {
       await ctx.set('credit',credit.id,credit.remaining,'REVOKED_HELD',credit.facts);
     }
+    await ctx.set('attestation',originalId,0,'REVOKED',{revocation:revoke.id});
     if (successor && original && await match(ctx,successor,'reinstate:'+successor.id,binding))
-      await ctx.set('attestation',originalId,0,'REINSTATED',{successor:successor.id,mode:'REPOSTED'});
+      await promote(ctx,originalId,successor,binding,'REPOSTED');
   }
   for (const original of originals) {
     if (await ctx.position('tombstone',original.id)) continue;
@@ -175,7 +198,7 @@ export async function attestations(ctx:Treasury) {
   }
   for (const successor of successors) {
     const original=uuid(successor.data.original);
-    if (!await ctx.position('attestation',original) || (await ctx.position('attestation',original))?.state!=='REINSTATED')
+    if (!await ctx.position('attestation',successor.id))
       await ctx.set('pending-attestation',successor.id,0,'WAITING',{original,revocation:successor.data.revocation});
     else if (await ctx.position('pending-attestation',successor.id))
       await ctx.set('pending-attestation',successor.id,0,'RESOLVED',{original});

@@ -1,6 +1,7 @@
 import { isUuid } from './protocol.ts';
 import { cents, fail, uuid } from './treasury-protocol.ts';
 import { Treasury } from './treasury-store.ts';
+import type { Position } from './treasury-store.ts';
 
 export async function bookedCash(ctx:Treasury) {
   for (const {fact} of await ctx.facts('CREDIT','DEBIT')) {
@@ -58,6 +59,8 @@ export async function reimburse(ctx:Treasury) {
     const winners=candidates.filter(proof=>!candidates.some(other=>other.lineage===proof.lineage &&
       other.data.supersedes===proof.id && other.cut>proof.cut));
     const current=await ctx.position('reimbursement',feeId);
+    // Historical finality evidence cannot replace a later allocation correction.
+    if (current?.facts.correction) continue;
     if (omitted.length || winners.length!==1 || winners[0].cut>boundary.cut ||
         (current && current.facts.proof!==winners[0].id)) {
       await ctx.set('incident',feeId,0,'PROOF_CONFLICT',{boundary:boundary.id,candidates:ids,omitted:omitted.map(row=>row.id)});
@@ -90,6 +93,25 @@ export async function reimburse(ctx:Treasury) {
   }
 }
 
+async function activeAllocation(ctx:Treasury,fee:Position) {
+  let allocation=await ctx.position('reimbursement',fee.id);
+  let journal=typeof allocation?.facts.journal==='string' ? allocation.facts.journal :
+    (await ctx.effect('reimbursement:'+fee.id))?.journal;
+  // Older releases moved the fee pointer without recording the destination head.
+  const correctionId=fee.facts.corrected;
+  if (typeof correctionId==='string' && allocation?.facts.correction!==correctionId) {
+    const correction=await ctx.effect('allocation-correction:'+correctionId);
+    if (correction?.facts.to===fee.id) {
+      journal=correction.facts.displaced ? journal : correction.journal;
+      if (!journal) return fail('ALLOCATION_JOURNAL_REQUIRED',409);
+      await ctx.set('reimbursement',fee.id,cents(correction.facts.minor),'FINAL',
+        {credit:correction.facts.credit,proof:correction.evidence,correction:correctionId,journal});
+      allocation=await ctx.position('reimbursement',fee.id);
+    }
+  }
+  return {allocation,journal};
+}
+
 export async function correctAllocations(ctx:Treasury) {
   for (const {fact} of await ctx.facts('ALLOCATION_CORRECT')) {
     const from=uuid(fact.data.from), to=uuid(fact.data.to);
@@ -97,25 +119,31 @@ export async function correctAllocations(ctx:Treasury) {
     const key='allocation-correction:'+fact.id;
     if (await ctx.effect(key)) continue;
     const a=await ctx.position('fee',from), b=await ctx.position('fee',to);
-    const allocation=await ctx.position('reimbursement',from);
-    const prior=await ctx.effect('reimbursement:'+from);
-    if (!a || !b || !prior?.journal || !allocation) continue;
+    if (!a || !b) continue;
+    const {allocation,journal}=await activeAllocation(ctx,a);
+    if (!journal || !allocation) continue;
     const minor=cents(fact.data.minor);
     const sealed=(await ctx.db.query(`SELECT 1 FROM omni.ledger_lines l JOIN omni.period_seals s
       USING(tenant_id,period) WHERE l.tenant_id=$1 AND l.journal_id=$2 LIMIT 1`,
-    [ctx.tenant,'adjustment:'+prior.journal])).rowCount;
+    [ctx.tenant,'adjustment:'+journal])).rowCount;
     if (!sealed || allocation.state!=='FINAL' || allocation.facts.proof!==fact.data.proof || minor!==allocation.remaining ||
         (b.remaining!==0 && b.remaining<minor) || a.facts.account===b.facts.account)
       return fail('SEALED_ALLOCATION_CORRECTION_REJECTED',409);
     const displaced=b.remaining===0 ? b.facts.credit : undefined;
     if (b.remaining===0 && typeof displaced!=='string') continue;
+    const destination=displaced ? await activeAllocation(ctx,b) : undefined;
+    if (displaced && (!destination?.journal || destination.allocation?.state!=='FINAL' ||
+        destination.allocation.facts.credit!==displaced)) return fail('DESTINATION_ALLOCATION_REQUIRED',409);
     if (await ctx.journal(key,fact,String(a.facts.account),displaced?'SurplusHold':String(b.facts.account),minor,
-      {reference:'adjustment:'+prior.journal+':'+String(a.facts.account),from,to,credit:allocation.facts.credit,displaced})) {
+      {reference:'adjustment:'+journal+':'+String(a.facts.account),from,to,credit:allocation.facts.credit,displaced})) {
+      const correctedJournal=displaced ? destination!.journal : (await ctx.effect(key))!.journal;
       await ctx.set('fee',from,a.remaining+minor,'OPEN',{...a.facts,credit:null,corrected:fact.id});
       const residual=b.remaining ? b.remaining-minor : 0;
       await ctx.set('fee',to,residual,residual?'OPEN':'SATISFIED',
         {...b.facts,credit:allocation.facts.credit,corrected:fact.id});
-      await ctx.set('reimbursement',from,0,'CORRECTED',{...allocation.facts,to,correction:fact.id});
+      await ctx.set('reimbursement',from,0,'CORRECTED',{...allocation.facts,journal,to,correction:fact.id});
+      await ctx.set('reimbursement',to,minor,'FINAL',
+        {credit:allocation.facts.credit,proof:fact.id,correction:fact.id,journal:correctedJournal});
       if (displaced) await ctx.set('surplus',fact.id,0,'FENCED',{held:minor,credit:displaced,to,consumed:null});
     }
   }

@@ -278,6 +278,70 @@ async function debitEnvelope(h:Harness,account:string,prior:Recorded,at=date(apr
   await h.ingest(statement);
   return {statement,alias,candidates};
 }
+
+test('M7-03 successive sealed corrections transfer active reimbursement lineage and preserve displaced credit', {timeout:45_000}, async t=>{
+  const db=await testDatabase();t.after(()=>db.close());const h=await setup(t,db);
+  const cases=[];
+  for (const satisfied of [false,true]) {
+    const account=await h.account();
+    const a=await receivable(h,account,'FeeA'), b=await receivable(h,account,'FeeB',satisfied);
+    const c=await receivable(h,account,'FeeExpense',false);
+    if (!satisfied) await h.ingest(b.advice);
+    await h.ingest(c.advice);
+    const old=pos(await h.state(account),'reimbursement',b.fee);
+    cases.push({account,a,b,c,satisfied,old});
+  }
+  const marchSeal=close(march), sealed=await h.go(marchSeal);
+  const corrections=[];
+  for (const entry of cases) {
+    const {account,a,b,satisfied,old}=entry;
+    const correction=await h.mint(account,'agency','ALLOCATION_CORRECT',
+      {from:a.fee,to:b.fee,proof:a.proof.fact.id,minor:50},{at:date(april),cut:10});
+    await h.ingest(correction);
+    // Recreate the destination state left by the previous release binary.
+    if (old) await db.fixture.query(`UPDATE omni.treasury_positions SET remaining=$4,state=$5,facts=$6
+      WHERE tenant_id=$1 AND account_id=$2 AND kind='reimbursement' AND id=$3`,
+      [h.enrollment.tenantId,account,b.fee,old.remaining,old.state,JSON.stringify(old.facts)]);
+    else await db.fixture.query(`DELETE FROM omni.treasury_positions
+      WHERE tenant_id=$1 AND account_id=$2 AND kind='reimbursement' AND id=$3`,
+      [h.enrollment.tenantId,account,b.fee]);
+    if (satisfied) assert.equal(pos(await h.state(account),'surplus',correction.fact.id)?.facts.credit,b.credit);
+    corrections.push({...entry,correction});
+  }
+  const aprilSeal=close(april,marchSeal.id), sealedApril=await h.go(aprilSeal);
+  for (const {account,a,b,c,correction} of corrections) {
+    const next=await h.mint(account,'agency','ALLOCATION_CORRECT',
+      {from:b.fee,to:c.fee,proof:correction.fact.id,minor:50},{at:date('2026-05'),cut:11});
+    await Promise.all([h.ingest(next),h.ingest(next)]);
+    const state:State=await h.state(account);
+    assert.equal(pos(state,'fee',b.fee)?.remaining,50);
+    assert.equal(pos(state,'fee',c.fee)?.remaining,0);
+    assert.equal(pos(state,'reimbursement',c.fee)?.facts.proof,next.fact.id);
+    assert.equal(pos(state,'reimbursement',c.fee)?.facts.credit,a.credit);
+    assert.equal(state.effects.filter(row=>row.effect==='allocation-correction:'+next.fact.id).length,1);
+    await h.ingest(await h.mint(account,'agency','ALLOCATION_CORRECT',
+      {from:c.fee,to:a.fee,proof:a.proof.fact.id,minor:50},{at:date('2026-06'),cut:12}),409);
+  }
+  const maySeal=close('2026-05',aprilSeal.id);await h.go(maySeal);
+  for (const {account,a,b,c,satisfied,correction} of corrections) {
+    const head=pos(await h.state(account),'reimbursement',c.fee)!;
+    const back=await h.mint(account,'agency','ALLOCATION_CORRECT',
+      {from:c.fee,to:a.fee,proof:head.facts.proof,minor:50},{at:date('2026-06'),cut:13});
+    await h.ingest(back);await h.ingest(back);
+    const state:State=await h.state(account);
+    assert.deepEqual([a,b,c].map(f=>pos(state,'fee',f.fee)?.remaining),[0,50,50]);
+    assert.equal(pos(state,'reimbursement',a.fee)?.facts.proof,back.fact.id);
+    const amounts=await h.amounts(account);
+    assert.deepEqual([amounts.FeeA,amounts.FeeB,amounts.FeeExpense],[0,50,50]);
+    if (satisfied) {
+      const surplus=pos(state,'surplus',correction.fact.id)!;
+      assert.deepEqual([surplus.remaining,surplus.facts.credit],[0,b.credit]);
+      assert.equal(amounts.SurplusHold,-50);
+    }
+  }
+  assert.deepEqual(await h.go(marchSeal),sealed);
+  assert.deepEqual(await h.go(aprilSeal),sealedApril);
+});
 const bankDebit=(h:Harness,account:string)=>h.mint(account,'bank','DEBIT',{minor:50,trace:'SAME-AMOUNT'},{cut:1});
 const bankReturn=(h:Harness,account:string,envelope:string,cut=3)=>
   h.mint(account,'bank','CREDIT',{minor:50,purpose:'RETURN',remitter:'DEMO-AGENCY',remittance:envelope},{cut,at:date(april)});
@@ -378,6 +442,64 @@ test('M7-05 permanent revocation, early reinstatement, continuity and open-perio
     assert.equal(state.effects.filter(row=>row.effect.startsWith('authority-only:')).length,mode==='continuity'?1:0);
   }
   assert.deepEqual(await h.go(seal),original);
+});
+
+test('M7-05 revocations follow reinstated authority through continuity, reposting and delayed predecessors', {timeout:45_000}, async t=>{
+  const db=await testDatabase();t.after(()=>db.close());const h=await setup(t,db);
+  const cases=[];
+  for (const mode of ['continuity','reposted','early','legacy']) {
+    const account=await h.account(1000), prior=await bankDebit(h,account);await h.ingest(prior);
+    const {statement}=await debitEnvelope(h,account,prior,date());
+    const credit=await h.mint(account,'bank','CREDIT',{minor:50,purpose:'RETURN',remitter:'DEMO-AGENCY',
+      remittance:statement.fact.id},{cut:3});await h.ingest(credit);
+    const binding={envelope:statement.fact.id,credit:credit.fact.id,minor:50};
+    const original=await h.mint(account,'agency','ATTEST',binding,{cut:4});await h.ingest(original);
+    const revoke=await h.mint(account,'agency','REVOKE',{...binding,original:original.fact.id},{cut:5,at:date(april)});
+    const next=await h.mint(account,'agency','REINSTATE',
+      {...binding,original:original.fact.id,revocation:revoke.fact.id},{cut:6,at:date(april)});
+    const nextRevoke=await h.mint(account,'agency','REVOKE',
+      {...binding,original:next.fact.id},{cut:7,at:date(april)});
+    cases.push({mode,account,binding,original,revoke,next,nextRevoke});
+  }
+  const seal=close(march), sealed=await h.go(seal);
+  for (const {mode,account,binding,original,revoke,next,nextRevoke} of cases) {
+    if (mode==='continuity' || mode==='legacy') await h.ingest(next);
+    await h.ingest(revoke);
+    if (mode==='early') await h.ingest(nextRevoke);
+    await h.ingest(next);
+    if (mode==='legacy') {
+      // Previous releases retained the journal owner on A1 after continuity promotion.
+      await db.fixture.query(`DELETE FROM omni.treasury_positions
+        WHERE tenant_id=$1 AND account_id=$2 AND kind='attestation' AND id=$3`,
+        [h.enrollment.tenantId,account,next.fact.id]);
+      await db.fixture.query(`UPDATE omni.treasury_positions SET facts=jsonb_set(facts,'{matched}',to_jsonb($4::text))
+        WHERE tenant_id=$1 AND account_id=$2 AND ((kind='credit' AND id=$3) OR (kind='envelope' AND id=$5))`,
+        [h.enrollment.tenantId,account,binding.credit,original.fact.id,binding.envelope]);
+      await db.fixture.query(`UPDATE omni.treasury_effects SET journal=NULL
+        WHERE tenant_id=$1 AND account_id=$2 AND effect=$3`,
+        [h.enrollment.tenantId,account,'authority-only:'+next.fact.id]);
+    }
+    await Promise.all([h.ingest(nextRevoke),h.ingest(nextRevoke)]);
+    const reopened:State=await h.state(account);
+    assert.deepEqual([pos(reopened,'envelope',binding.envelope)?.remaining,
+      pos(reopened,'credit',binding.credit)?.remaining],[50,50]);
+    assert.equal(pos(reopened,'credit',binding.credit)?.state,'REVOKED_HELD');
+    assert.equal(pos(reopened,'tombstone',next.fact.id)?.state,'PERMANENT');
+    assert.equal(reopened.effects.filter(row=>row.effect==='revoke:'+next.fact.id).length,mode==='early'?0:1);
+    for (const old of [original,revoke,next,nextRevoke]) await h.ingest(old);
+    assert.deepEqual((await h.state(account)).effects,reopened.effects);
+    const final=await h.mint(account,'agency','REINSTATE',
+      {...binding,original:next.fact.id,revocation:nextRevoke.fact.id},{cut:8,at:date(april)});
+    await h.ingest(final);await h.ingest(final);
+    const settled:State=await h.state(account);
+    assert.deepEqual([pos(settled,'envelope',binding.envelope)?.remaining,
+      pos(settled,'credit',binding.credit)?.remaining],[0,0]);
+    assert.equal(pos(settled,'attestation',final.fact.id)?.state,'ACTIVE');
+    assert.equal(pos(settled,'credit',binding.credit)?.facts.matched,final.fact.id);
+    await h.ingest(nextRevoke);
+    assert.deepEqual((await h.state(account)).effects,settled.effects);
+  }
+  assert.deepEqual(await h.go(seal),sealed);
 });
 
 function report(seal:string,lineage=id(),predecessor:string|null=null,slices:object[]=[],treasury?:object[]) {

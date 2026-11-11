@@ -553,7 +553,7 @@ test('M3-07 populated v1/v2 upgrade retains exact bytes and vouchers, and retail
     await isolated.upgrade();
     const reopened = new Terminal(f.path);
     reopened.close();
-    assert.equal(local(f.path, db => db.prepare('PRAGMA user_version').get()?.user_version), 4);
+    assert.equal(local(f.path, db => db.prepare('PRAGMA user_version').get()?.user_version), 6);
     assert.deepEqual(legacyRows(), before);
     url = await f.listen(start());
     await op({ action: 'retail-enable', legacyDrained: true, positionId: position.positionId });

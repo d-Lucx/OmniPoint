@@ -18,6 +18,9 @@ import type { DeviceAdapter, DeviceKind } from './retail-devices.ts';
 import { parseCard } from './card-event.ts';
 import { PaymentRegister } from './payment-local.ts';
 import type { PaymentOptions } from './payment-local.ts';
+import { LocalModules } from './module-local.ts';
+import { makeModuleSale, moduleAccrual, moduleBytes, modulePrintable, parseModuleSale, paymentLines } from './module-sale.ts';
+import type { ModuleSale } from './module-sale.ts';
 
 export interface RetailLocalOptions {
   supervisor: { actorId: string; pin: string; signer: SigningKey };
@@ -39,13 +42,16 @@ export class RetailRegister {
   private readonly options: RetailLocalOptions;
   private cloudState: 'UNKNOWN' | 'OFFLINE' | 'ONLINE' = 'UNKNOWN';
   readonly payment?: PaymentRegister;
+  readonly modules: LocalModules;
 
   constructor(db: DatabaseSync, scope: Scope, options: RetailLocalOptions) {
     this.db = db;
     this.scope = scope;
     this.options = options;
+    this.modules = new LocalModules(db, scope, sku => this.catalog().find(quote => quote.sku === sku), options.cloud);
     if (options.payment) this.payment = new PaymentRegister(db,scope,options.payment,{
       build: id => {
+        this.modules.require('retail');
         const shift = this.open();
         if (this.db.prepare("SELECT 1 FROM retail_refunds WHERE shift_id=? AND state IN ('RESERVED','UNCERTAIN')").get(shift.shift_id)) {
           throw new Error('Resolve cash refund first');
@@ -149,12 +155,13 @@ export class RetailRegister {
     const row = this.db.prepare('SELECT event_bytes FROM retail_events WHERE event_id=?').get(id);
     if(!row) return;
     const bytes=Buffer.from(row.event_bytes as Uint8Array);
-    return record(JSON.parse(bytes.toString('utf8'))).version===4 ? parseCard(bytes).sale : parseRetail(bytes);
+    const version = record(JSON.parse(bytes.toString('utf8'))).version;
+    return version === 5 ? parseModuleSale(bytes).sale : version === 4 ? parseCard(bytes).sale : parseRetail(bytes);
   }
 
-  private append(event: RetailEvent, card?: Buffer): void {
-    const bytes = card ?? jsonBytes(event);
-    if(card) parseCard(bytes); else parseRetail(bytes);
+  private append(event: RetailEvent, card?: Buffer, module?: ModuleSale): void {
+    const bytes = module ? moduleBytes(module) : card ?? jsonBytes(event);
+    if (module) parseModuleSale(bytes); else if(card) parseCard(bytes); else parseRetail(bytes);
     this.db.prepare('INSERT INTO retail_events (event_id,shift_id,source_no,kind,event_bytes,digest) VALUES (?,?,?,?,?,?)')
       .run(event.saleId, event.shiftId, event.sequence, event.kind, bytes, digest(bytes));
   }
@@ -200,6 +207,7 @@ export class RetailRegister {
   }
 
   scan(code: unknown, bySku = false) {
+    this.modules.require('retail');
     if (typeof code !== 'string' || (bySku ? !/^[A-Z0-9-]{1,32}$/.test(code) : !/^\d{4,18}$/.test(code))) {
       throw new Error('Malformed scan or SKU');
     }
@@ -284,16 +292,57 @@ export class RetailRegister {
     return {...head,kind:'SALE',receiptId:randomUUID(),lines,...sum,tenderMinor,changeMinor:tenderMinor-sum.totalMinor};
   }
 
-  private saveSale(event:RetailSale,card?:Buffer,printable=salePrintable(event)) {
+  private saveSale(event:RetailSale,card?:Buffer,printable=salePrintable(event),module?:ModuleSale) {
     const current=this.header(this.open().shift_id,event.saleId);
     if(current.shiftId!==event.shiftId||current.sequence!==event.sequence) throw new Error('Frozen shift cut changed');
-    this.append(event,card);
+    this.append(event,card,module);
     const spend=this.db.prepare('INSERT INTO retail_spends VALUES (?,?,?,?)');
     for(const line of event.lines) for(const unit of line.units) spend.run(unit.sliceId,unit.grantId,line.id,event.saleId);
-    if(!card) this.cash(event,event.totalMinor);
+    if(!card) this.cash(event,event.tenderMinor-event.changeMinor);
     this.saveReceipt(event,printable);
     if(!card) this.intent(event.saleId,'DRAWER',null);
-    this.db.prepare('DELETE FROM retail_cart_lines WHERE shift_id=?').run(event.shiftId);
+    if(!module) this.db.prepare('DELETE FROM retail_cart_lines WHERE shift_id=?').run(event.shiftId);
+  }
+
+  authorizeEstimate(input: Record<string,unknown>) {
+    this.authorized(input.pin);
+    return this.modules.authorize(input.id,input.operationId,input.revision,input.consent,
+      facts => this.approval(input.pin,'service-estimate',facts));
+  }
+
+  moduleTender(input: Record<string,unknown>) {
+    const { id, aggregate, revision, check, before, paid, tip } = input;
+    if (!isUuid(id) || !isUuid(aggregate) || !money(revision,1) || !money(check) || !money(before) || !money(paid,1) || !money(tip))
+      throw new Error('Invalid module tender');
+    const hash = digest(jsonBytes([aggregate,revision,check,before,paid,tip]));
+    return this.write(() => {
+      const previous = this.modules.tenders(aggregate).find(row => row.tender_id === id);
+      if (previous) {
+        if (previous.request_digest !== hash) throw new Error('Tender request conflict');
+        return this.receipt(id)!;
+      }
+      this.unfrozen();
+      const payable = this.modules.payable(aggregate,revision,check);
+      if (before !== payable.before) throw new Error('Stale check balance');
+      const { plan, claimed } = payable;
+      const head = { ...this.header(this.open().shift_id,id), kind:'SALE' as const, receiptId:randomUUID() };
+      const slices: string[] = [];
+      const claims = paymentLines(plan,check,before,paid).flatMap(({source}) => {
+        if (source.item === 'labor' || claimed.has(source.id)) return [];
+        const unit = availableQuota(this.db,source.quote.sku,head.occurredAt,slices,true);
+        if (!unit || !this.db.prepare('SELECT 1 FROM retail_positions WHERE sku=?').get(source.quote.sku))
+          throw new Error('Retail quota required');
+        slices.push(unit.sliceId);
+        return [{source:source.id,unit}];
+      });
+      const prior = this.db.prepare(`SELECT coalesce(sum(json_extract(m.facts,'$.tip')),0) AS tips
+        FROM module_tenders m JOIN retail_events e ON e.event_id=m.tender_id WHERE e.shift_id=?`).get(head.shiftId);
+      const event = makeModuleSale(head,plan,check,before,paid,tip,Number(prior?.tips),claims);
+      this.saveSale(event.sale,undefined,modulePrintable(event),event);
+      this.db.prepare('INSERT INTO module_tenders VALUES (?,?,?,?,?)').run(id,aggregate,check,hash,
+        JSON.stringify({ paid, tip, claimed:claims.map(claim => claim.source), ...moduleAccrual(event) }));
+      return this.receipt(id)!;
+    });
   }
 
   async checkout(id: unknown, tender: unknown, boundary?: CheckoutBoundary): Promise<Receipt> {
@@ -304,11 +353,13 @@ export class RetailRegister {
       const previous = this.event(id);
       if (previous) {
         if(this.db.prepare('SELECT 1 FROM fiscal_local_receipts WHERE intent_id=?').get(id)) throw new Error('Card receipt already issued');
+        if(this.db.prepare('SELECT 1 FROM module_tenders WHERE tender_id=?').get(id)) throw new Error('Module receipt already issued');
         if (previous.kind !== 'SALE' || previous.tenderMinor !== tender) throw new Error('Checkout request conflict');
         receipt = this.receipt(id)!;
         this.db.exec('COMMIT');
         return receipt;
       }
+      this.modules.require('retail');
       this.saveSale(this.buildSale(id,tender));
       receipt = this.receipt(id)!;
       if (boundary) await boundary('before-commit');
@@ -590,19 +641,19 @@ export class RetailRegister {
     let ackId: string | null = null;
     let ackBytes: Buffer | null = null;
     try {
-      const card = record(JSON.parse(item.bytes.toString('utf8'))).version===4;
-      const event = card ? parseCard(item.bytes).sale : parseRetail(item.bytes);
+      const version = record(JSON.parse(item.bytes.toString('utf8'))).version;
+      const event = version === 5 ? parseModuleSale(item.bytes).sale : version === 4 ? parseCard(item.bytes).sale : parseRetail(item.bytes);
       if (event.saleId !== item.id || digest(item.bytes) !== item.digest) throw new Error('Invalid stored retail event');
-      const { response, body } = await this.cloud('sync', card?'/v4/register':'/v3/register', item.bytes);
+      const { response, body } = await this.cloud('sync', version === 5 ? '/v5/register' : version === 4 ? '/v4/register' : '/v3/register', item.bytes);
       result = 'ACK_REJECTED';
       if (response.status === 202) {
         const reason = body.length ? JSON.parse(body.toString('utf8')).reason : '';
         result = ['SHIFT_OPEN_MISSING','SHIFT_SEQUENCE_GAP','CUSTODY_RECEIPT_MISSING','FISCAL_GAP','FISCAL_FORK',
-          'FISCAL_RETIRED','FISCAL_DEPENDENCY_HELD'].includes(reason) ? reason : 'HTTP_202';
+          'FISCAL_RETIRED','FISCAL_DEPENDENCY_HELD','PERIOD_SEALED'].includes(reason) ? reason : 'HTTP_202';
       }
       else {
         const ack = verifyVoucher(response.status, body, response.headers, this.options.cloud!.keys,
-          card?{...event,version:4}:event, item.digest);
+          version === 5 || version === 4 ? {...event,version}:event, item.digest);
         if (ack.disposition === 'BACKORDER' && event.kind !== 'SALE') throw new Error('Unexpected backorder');
         if (event.kind === 'SALE' && (ack.disposition === 'BACKORDER' || ack.disposition === 'COMMITTED')) {
           const lines: unknown = JSON.parse(body.toString('utf8')).lines;

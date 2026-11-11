@@ -10,6 +10,7 @@ import type { Scope, SignedEvidence } from './protocol.ts';
 import { InventoryError } from './quota-cloud.ts';
 import type { RetailSale, Supervisor } from './retail-protocol.ts';
 import { requireApproval } from './retail-returns-cloud.ts';
+import { ledgerWriter } from './period-close.ts';
 
 export interface PaymentTrust {
   routes: readonly PaymentRoute[];
@@ -95,6 +96,7 @@ async function storeEvidence(db: PoolClient, evidence: Evidence, packet: unknown
 
 export async function captured(db: PoolClient, proof: Evidence, packet: unknown): Promise<Case> {
   const { operation: op, state } = proof.fact;
+  await ledgerWriter(db,op.tenantId);
   if (op.kind !== 'CAPTURE' || state !== 'CAPTURED') throw new InventoryError('CAPTURE_REQUIRED', 422);
   const fresh = await db.query(
     `INSERT INTO omni.payment_cases

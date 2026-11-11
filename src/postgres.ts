@@ -43,7 +43,7 @@ export async function migrate(pool: Pool, runtimeRole: string): Promise<void> {
     await db.query('SELECT pg_advisory_xact_lock(71422101)');
     await db.query('CREATE SCHEMA IF NOT EXISTS omni');
     await db.query('CREATE TABLE IF NOT EXISTS omni.migrations (version integer PRIMARY KEY)');
-    const files = ['001-cloud.sql', '002-cloud.sql', '003-cloud.sql', '004-cloud.sql'];
+    const files = ['001-cloud.sql', '002-cloud.sql', '003-cloud.sql', '004-cloud.sql', '005-cloud.sql', '006-cloud.sql', '007-cloud.sql', '008-cloud.sql'];
     const { rows } = await db.query<{ version: number }>('SELECT version FROM omni.migrations');
     for (const [index, file] of files.entries()) {
       const version = index + 1;
@@ -77,6 +77,16 @@ export async function migrate(pool: Pool, runtimeRole: string): Promise<void> {
       GRANT UPDATE (state,refund_attempt,refund_reservation,sale_id) ON omni.payment_cases TO ${role};
       GRANT UPDATE (head_sequence,head_digest,retired_by) ON omni.fiscal_epochs TO ${role};
       GRANT UPDATE (status,reason) ON omni.fiscal_observations TO ${role};
+      GRANT SELECT ON omni.capability_profiles TO ${role};
+      GRANT SELECT, INSERT ON omni.service_appointments TO ${role};
+      GRANT SELECT, INSERT ON omni.module_tenders TO ${role};
+      GRANT SELECT ON omni.ledger_lines TO ${role};
+      GRANT SELECT, INSERT ON omni.treasury_accounts,omni.treasury_attempts,omni.treasury_facts,omni.treasury_collisions,
+        omni.treasury_positions,omni.treasury_effects TO ${role};
+      GRANT UPDATE(state) ON omni.treasury_attempts TO ${role};
+      GRANT UPDATE(remaining,state,facts) ON omni.treasury_positions TO ${role};
+      GRANT SELECT, INSERT ON omni.period_seals, omni.governed_adjustments, omni.cash_custody,
+        omni.report_plans, omni.report_exports, omni.report_withdrawals, omni.late_ledger_holds TO ${role};
     `);
     await db.query('COMMIT');
   } catch (error) {

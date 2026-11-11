@@ -5,6 +5,7 @@ import { denominations } from '../retail-money.ts';
 import type { LineMoney, Quote } from '../retail-money.ts';
 import { Diagnostics } from './retail-diagnostics.tsx';
 import type { DiagnosticsState } from './retail-diagnostics.tsx';
+import { KitchenDisplay, ModulePanel } from './module-views.tsx';
 
 type Receipt = { receiptId: string; eventId: string; printable: string; lines?: Array<{ id: string; sku: string }> };
 type Cart = LineMoney & { id: string; quote: Quote; quantity: number; discount: { amount: number } | null };
@@ -53,7 +54,7 @@ function App() {
   const [receipt, setReceipt] = useState<Receipt>();
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
-  const [screen, setScreen] = useState<'register' | 'diagnostics'>('register');
+  const [screen, setScreen] = useState<'register' | 'diagnostics' | 'workflows'>('register');
   const [search, setSearch] = useState('');
   const [scan, setScan] = useState('');
   const [cash, setCash] = useState('');
@@ -311,8 +312,10 @@ function App() {
     {state && <nav className="row" aria-label="Register navigation">
       <button className="secondary" onClick={() => setScreen('register')}>Register</button>
       <button className="secondary" onClick={() => setScreen('diagnostics')}>Diagnostics</button>
+      <button className="secondary" onClick={() => setScreen('workflows')}>Workflows</button>
       <button disabled={busy} onClick={() => void run('sync', {}, data => setMessage(String(data)))}>Sync next</button>
-    </nav>}</header><main><p className="notice" aria-live="polite">{message}</p>{content}</main></>;
+    </nav>}</header><main><p className="notice" aria-live="polite">{message}</p>
+    {state && screen === 'workflows' ? <ModulePanel /> : content}</main></>;
 }
 
-createRoot(document.getElementById('app')!).render(<App />);
+createRoot(document.getElementById('app')!).render(location.pathname === '/kitchen' ? <KitchenDisplay /> : <App />);

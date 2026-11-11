@@ -7,13 +7,16 @@ import { isCounter, isIsoDate, isSignedEvidence, isUuid } from './protocol.ts';
 import type { SigningKey } from './protocol.ts';
 import type { Supervisor } from './retail-protocol.ts';
 import type { PaymentTrust } from './payment-cloud.ts';
+import type { TreasuryTrust } from './treasury-protocol.ts';
 
-export interface InventoryOperator { tenantId: string; token: string; actorId?: string }
+export interface InventoryOperator { tenantId: string; token: string; actorId?: string; governance?: true }
 export interface InventoryOptions {
   operators?: readonly InventoryOperator[];
   custodyKeys?: ReadonlyMap<string, KeyObject>;
   supervisors?: readonly Supervisor[];
   payments?: PaymentTrust;
+  governanceSigner?: SigningKey;
+  treasury?: TreasuryTrust;
 }
 
 export async function inventoryAction(

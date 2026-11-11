@@ -159,13 +159,41 @@ export async function removeRetailCloudFixture(db: TestDatabase) {
 export function removePaymentLocalFixture(path:string) {
   const db=new DatabaseSync(path);
   try {
-    db.exec(`BEGIN; DROP TABLE fiscal_local_receipts; DROP TABLE payment_incidents; DROP TABLE payment_evidence;
+    db.exec(`BEGIN; DROP TABLE module_tenders; DROP TABLE module_events; DROP TABLE module_profile;
+      DROP TABLE fiscal_local_receipts; DROP TABLE payment_incidents; DROP TABLE payment_evidence;
       DROP TABLE payment_attempts; DROP TABLE payment_intents; PRAGMA user_version=3; COMMIT;`);
   } finally { db.close(); }
 }
 
 export async function removePaymentCloudFixture(db:TestDatabase) {
-  await db.fixture.query(`DROP TABLE omni.fiscal_observations,omni.fiscal_grants,omni.fiscal_epochs,
+  await removeGovernanceFixture(db);
+  await db.fixture.query(`DROP TABLE omni.module_tenders;
+    ALTER TABLE omni.retail_lines ALTER COLUMN position_id SET NOT NULL;
+    ALTER TABLE omni.retail_postings DROP CONSTRAINT retail_postings_account_check;
+    ALTER TABLE omni.retail_postings ADD CHECK (account IN ('Cash','Revenue','SalesTax'));
+    DROP TABLE omni.service_appointments,omni.capability_profiles;
+    DROP TABLE omni.fiscal_observations,omni.fiscal_grants,omni.fiscal_epochs,
     omni.payment_postings,omni.payment_provider_events,omni.payment_cases;
-    DELETE FROM omni.migrations WHERE version=4;`);
+    DELETE FROM omni.migrations WHERE version IN (4,5,6);`);
+}
+
+export async function removeGovernanceFixture(db:TestDatabase) {
+  await removeTreasuryFixture(db);
+  await db.fixture.query(`DROP TRIGGER ledger_record ON omni.journals;
+    DROP TRIGGER ledger_record ON omni.journal_lines;
+    DROP TRIGGER ledger_record ON omni.retail_postings;
+    DROP TRIGGER ledger_record ON omni.payment_postings;
+    DROP TRIGGER cash_cut_lock ON omni.retail_cash;
+    DROP TRIGGER cash_cut_lock ON omni.retail_closes;
+    DROP TABLE omni.report_withdrawals,omni.report_exports,omni.report_plans,omni.cash_custody,
+      omni.governed_adjustments,omni.period_seals,omni.ledger_lines,omni.late_ledger_holds;
+    DROP FUNCTION omni.ledger_record(),omni.ledger_open(uuid,text),omni.ledger_lock(uuid),omni.ledger_lock_shared(uuid),
+      omni.ledger_month(timestamptz),omni.ledger_event_time(bytea),omni.cash_cut_lock();
+    DELETE FROM omni.migrations WHERE version=7`);
+}
+
+export async function removeTreasuryFixture(db:TestDatabase) {
+  await db.fixture.query(`DROP TABLE omni.treasury_effects,omni.treasury_positions,omni.treasury_collisions,omni.treasury_facts,
+    omni.treasury_attempts,omni.treasury_accounts;
+    DELETE FROM omni.migrations WHERE version=8`);
 }

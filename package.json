@@ -8,7 +8,8 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "npm run build:register && node --test --test-concurrency=1 test/milestone.test.ts test/quota.test.ts test/retail.test.ts test/payment.test.ts",
+    "test": "npm run build:register && node --test --test-concurrency=1 test/milestone.test.ts test/quota.test.ts test/retail.test.ts test/payment.test.ts test/modules.test.ts test/module-completion.test.ts test/governance.test.ts test/treasury.test.ts test/release-cli.test.ts",
+    "test:storage": "node --test test/storage-filesystem.test.ts",
     "demo:m2": "node --test --test-name-pattern=M2-01 --test-name-pattern=M2-05 test/quota.test.ts",
     "terminal": "node src/terminal-cli.ts",
     "cloud": "node src/cloud-cli.ts",
@@ -18,6 +19,11 @@
     "register": "node src/register-cli.ts",
     "demo:m3": "npm run build:register && node --test test/retail.test.ts",
     "demo:m4": "npm run build:register && node --test test/payment.test.ts",
+    "demo:m5": "npm run build:register && node --test --test-concurrency=1 test/modules.test.ts test/module-completion.test.ts",
+    "demo:m6": "node --test --test-concurrency=1 test/governance.test.ts",
+    "demo:m7": "node --test --test-concurrency=1 test/treasury.test.ts",
+    "treasury:fixture": "node src/treasury-fixture-cli.ts",
+    "governance": "node src/governance-cli.ts",
     "payment:fixture": "node src/payment-fixture-cli.ts"
   },
   "dependencies": {

@@ -793,7 +793,7 @@ test(
       const upgraded = f.terminal(0);
       assert.equal(
         local(a.target.path, (db) => db.prepare('PRAGMA user_version').get()?.user_version),
-        4,
+        6,
       );
       assert.deepEqual(snapshot(), original);
       assert.equal(upgraded.register.receipt(sale.receiptId)?.printable, sale.printable);

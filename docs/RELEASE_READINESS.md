@@ -1,5 +1,9 @@
 # OmniPoint M1–M7 release readiness
 
+UI delivery update (2026-11-11): the operational overhaul was implemented on the merged `main` checkout in an inspectable working tree. Its [audit](UI_UX_AUDIT.md), [staff guide](USER_MANUAL.md), and [verification report](UI_UX_VALIDATION.md) record 69 passing tests, screenshots, preserved contracts and unavailable gates. The candidate narrative below describes the earlier release handoff; it is not the current checkout identity or a deployment authorization.
+
+Refinement handoff (2026-11-13): the subsequent [UI refinement](UI_REFINEMENT.md) preserves that overhaul and records **70/70 passing tests**, current screenshots, navigation/read-state regression fixes and outstanding verification limits. The 69-test count below is historical first-overhaul evidence.
+
 ## Candidate
 
 Candidate branch: `release/m1-m7-rc`. Exact identity: `git rev-parse HEAD` (also retained in hosted artifacts). This packages the local M5–M7 foundation, including migrations 005–008, on published M4 commit `c91b1d1bdc4f185d85e5a23a8f85ba3e5512df73`. Parent design documents and prior history are preserved. No production deployment or main-branch replacement is included.
@@ -44,7 +48,7 @@ Manual use requires enrolled terminal/operator credentials, trusted public keys,
 
 ## Gate-to-entry-point mapping
 
-Run a listed file with node --test after build:register, or filter by gate using --test-name-pattern. The core suite contains 64 tests: 60 existing milestone tests, two release CLI regressions, and two treasury review regressions. The separate filesystem test requires an explicit disposable mount and skips visibly without one.
+Run a listed file with node --test after build:register, or filter by gate using --test-name-pattern. The merged baseline contained 64 tests: 60 milestone tests, two release CLI regressions, and two treasury review regressions. The current UI delivery adds five money/recovery/layout/journey regressions; its final suite passed 69 tests. The separate filesystem test requires an explicit disposable mount and skips visibly without one.
 
 | Gates | Normal boundary | Executable coverage |
 | --- | --- | --- |

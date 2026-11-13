@@ -1,0 +1,104 @@
+
+> omnipoint@0.1.0 test
+> npm run build:register && node --test --test-concurrency=1 test/milestone.test.ts test/quota.test.ts test/retail.test.ts test/payment.test.ts test/modules.test.ts test/module-completion.test.ts test/governance.test.ts test/treasury.test.ts test/release-cli.test.ts test/ui-money.test.ts test/ui-recovery.test.ts
+
+
+> omnipoint@0.1.0 build:register
+> esbuild src/ui/register.tsx --bundle --minify --outfile=dist/register.js
+
+
+  dist\register.js  265.3kb
+
+Done in 88ms
+✔ M6-01 blind drawer close, unmatched drop, witnessed vault delta and deposit handoff (2777.1331ms)
+✔ M6-02 real writer versus close in both orders, late hold, exact replay and successor correction (2851.7381ms)
+✔ M6-03 verifies signed close backing and restores sealed cash and captured funds before successor writes (8076.1347ms)
+✔ M6-04 approved comparative plans pin exact restoration, absorption, replacement and revocation (2070.9189ms)
+✔ M6-05 exact signed export, tenant isolation, and publication-versus-withdrawal race (2044.9521ms)
+✔ M6-06 populated 006 upgrade preserves exact receipts, BLOBs, signed vouchers, postings and open capture (2698.375ms)
+Node v24.22.1 / PostgreSQL 17.11
+✔ M1-01 committed offline checkout survives terminal death and a lost cloud response (2787.3734ms)
+ℹ sale=bde07fed-c622-40c7-927c-baa6d75647ae receipt=ee1d3c0d-2e62-441c-b001-9eba076870f0 sha256=c8d6495135748144fbd824e427ca12cd3fbf54a1ba299c768a1617b31678d191 SQLite=3.53.4
+ℹ Outbox PENDING → IN_FLIGHT → RETRY_WAIT → SYNCED; both stocks 3 → 2; Cash DR 2000, Revenue CR 2000
+✔ M1-02 killing before SQLite commit rolls back every checkout effect (558.1491ms)
+✔ M1-03 a deferred PostgreSQL constraint fails at COMMIT and permits a fresh retry (444.6903ms)
+✔ M1-04 competing replays and signers converge, while both identity conflicts leave one sale (675.3248ms)
+✔ M1-05 invalid, mismatched, and forged ACKs leave the outbox actionable (636.9774ms)
+✔ M1-06 authentication, RLS, and tenant foreign keys hold across pooled backend reuse (552.6429ms)
+✔ M1-07 recovery and repeated virtual deliveries preserve one receipt and its content (604.4408ms)
+✔ replay completes ACK issuance after interruption between the two commits (476.7527ms)
+✔ a dead sync worker is reclaimed after lease expiry and a signed conflict is held (1061.6744ms)
+✔ UI lost workflow and tender responses replay original identities after reload with one receipt (5740.2011ms)
+✔ M5-01 browser offline check splits, exact vouchers, quota and tip replay across capability change (6157.2899ms)
+✔ M5-02 approved service revisions, mixed invoice, restart and one commission (4997.4568ms)
+✔ M5-05 restores paired cuts, exact voucher and captured hold, quarantines and refuses a gap (8321.7366ms)
+✔ M5-03/M5-04 another tenant settles and an original module voucher replays under background pressure (2864.2035ms)
+ℹ Module live and replay completed in 187 ms with one held database worker
+✔ M5-06 populated 005 upgrades with exact local receipt and cloud voucher (2618.735ms)
+✔ M5-01 shared check portions inherit a single physical backorder (2317.7852ms)
+✔ M5 kitchen foundation resumes scoped tickets across display reload with cloud offline (6950.3789ms)
+✔ M5 scheduling foundation serializes shared resource, scopes profiles and preserves confirmed replay (2021.0928ms)
+✔ M5 admission foundation rejects excess background work while live and replay requests progress (2686.9675ms)
+ℹ one blocked background connection, one 429, tenant B live and tenant A replay finished in 163 ms
+✔ M4-01 browser recovery after provider commit, process death and lost cloud voucher (6084.0286ms)
+ℹ sale=d497ea9f-1fd9-4ccf-8ed8-d26d99a41d91 receipt=08bfb2ff-2740-4e3f-8f1d-5d60d935ee61 sha256=862abee280705205f24d8126c9cf3f7b89e32a94766856a2ceed21c6ea78c7ad; one capture 220; one quota unit; zero drawer or Cash effect
+✔ M4-02 holds unknown non-idempotent attempts, reconciles duplicate evidence and links a replacement after decline (482.9369ms)
+✔ M4-02 idempotent replay queries status and sends the same original attempt inside the window (373.1005ms)
+✔ M4-03 expired fiscal authority holds capture and a lost refund response is recovered once (503.0832ms)
+✔ M4-04 signer commits before POS death and recovers exact bytes through expired authority (988.534ms)
+✔ M4-05 durable fiscal gaps promote in order, retain forks and fence replacement genesis (699.8004ms)
+✔ M4-06 SQLITE_FULL rolls back only the terminal write, preserving one capture and signed receipt (516.06ms)
+ℹ SQLite returned result code 13 with a page-limit fault during the receipt INSERT; reopened WAL database recovered the original signer proof.
+✔ M4-07 boundary rejects synthetic card data, wrong fiscal keys and pooled cross-tenant access (1152.4524ms)
+✔ M4-07 forward migration preserves populated v3 receipts, events, digests and original vouchers (4374.7623ms)
+▶ M2-01 offline contenders converge under both commit orders and a live race
+  ✔ terminal A commits first (1388.3006ms)
+  ℹ winner=47ef3827-c0b6-45da-be9b-29d1528891bd order=1; backorder=2d76954e-417e-47bc-b70e-e3aa85700e7a order=2; one shelf unit, two receipts, Cash DR 4000, Revenue CR 4000
+  ✔ terminal B commits first (1021.2233ms)
+  ℹ winner=3ec8b30b-1046-4b2b-b820-c8c12fce7c70 order=3; backorder=cd6be8d6-92e6-448d-b63c-289b3c3621b9 order=4; one shelf unit, two receipts, Cash DR 4000, Revenue CR 4000
+  ✔ concurrent race (1223.2216ms)
+  ℹ winner=3a7192ce-f3b7-4947-942a-558d6d655ad2 order=5; backorder=3c100bc0-ecc3-49e1-a5c3-9215ab74fe13 order=6; one shelf unit, two receipts, Cash DR 4000, Revenue CR 4000
+✔ M2-01 offline contenders converge under both commit orders and a live race (5028.9027ms)
+✔ M2-02 issuance is exclusive and expired, exhausted, and unauthorized grants fail closed (4060.8061ms)
+✔ M2-03 quota spend survives post-commit death and lost response and rolls back before commit (1628.9652ms)
+▶ M2-04 partial custody settles under either order and a real race without duplicate handoff
+  ✔ sale-first (808.3438ms)
+  ✔ receipt-first (706.7234ms)
+  ✔ race (863.1883ms)
+✔ M2-04 partial custody settles under either order and a real race without duplicate handoff (2380.9063ms)
+✔ M2-05 authorized shortfall fulfillment consumes a separately evidenced replacement once (2092.7286ms)
+ℹ shortfall sale=fb722f94-6fa8-474c-ae4b-1c75165aafe7 receipt=0ca0c203-f8f6-4d72-b2c0-87448fbb8c0d OPEN → RESOLVED by b1670190-97a5-4daa-be7a-2023abcb7517; one independently received and consumed unit; original BACKORDER voucher and cash unchanged
+✔ M2-06 populated v1 upgrade preserves bytes and vouchers, fences legacy sales and rebuilds stock (7708.5163ms)
+✔ Release CLI: offline terminal checkout recovers and reprints the same committed receipt (2186.0379ms)
+✔ Release CLI: operator closes, verifies, approves, publishes and retrieves exact signed bytes (5581.7228ms)
+✔ M3-01 browser checkout offline, forced terminal restart, dropped final voucher and exact replay (7970.2411ms)
+ℹ original receipt=543a4443-2a8b-4a08-ae91-e1f20699e17b; sale SHA-256=9f5bc0509b64aad3e0c475141e3d3db5b78018f9b3abef40c6144af787230c26; $2.20 cash and one quota unit; ACK survived reopen
+✔ UI register dollars, receipt-linked return, payout close fence and blind revision persist real effects (3671.894ms)
+✔ UI long product names, maximum quantity and reduced motion reflow at register and narrow sizes (3147.1602ms)
+✔ UI in-page navigation preserves workflow draft and payment context without submitting a sale (3601.295ms)
+✔ M3-02 immutable cart quote, half-even tax, discount and mixed durable line outcomes (3229.3567ms)
+✔ M3-03 partial cash returns, last-unit contention, payout recovery and independent restock (1157.4305ms)
+✔ M3-04 blind close covers opening, net cash, refund and drop and applies only the revised variance delta (374.5885ms)
+✔ M3-05 manual SKU and device faults preserve stable commands and reprint the same receipt (229.5279ms)
+✔ M3-06 late custody reattributes a count, leaves an outstanding grant fenced, and applies evidenced deltas once (460.9703ms)
+✔ M3-07 populated v1/v2 upgrade retains exact bytes and vouchers, and retail tables respect tenant isolation (5595.9163ms)
+✔ M7-01 lost filing and funding responses recover exact attempts, split settlement and credit capacity (2736.7133ms)
+✔ M7-02 six arrival orders converge, unrelated cash stays suspended and incomparable proofs freeze (4068.9833ms)
+✔ M7-03 sealed allocations, fenced surplus and dual execution preserve the original journal (3126.3644ms)
+✔ M7-03 successive sealed corrections transfer active reimbursement lineage and preserve displaced credit (3441.3806ms)
+✔ M7-04 sealed overlap books one aggregate debit and differentiates four amendment effects (2644.9243ms)
+✔ M7-05 permanent revocation, early reinstatement, continuity and open-period inverse (3558.636ms)
+✔ M7-05 revocations follow reinstated authority through continuity, reposting and delayed predecessors (4593.0418ms)
+✔ M7-06 signed treasury report provenance and cold restore preserve alias, tombstone and holds (11464.4856ms)
+✔ M7-07 populated 007 upgrade preserves exact vouchers, seals and reports, and isolates tenant data (4509.8115ms)
+✔ M7-01 unknown execution is held, explicit idempotent resume and rejected replacement preserve lineage (2790.758ms)
+✔ staff dollar amounts convert exactly and reject rounding, exponent and overflow (32.6475ms)
+✔ workflow retries retain original request after reload and never persist supervisor PIN (20.0741ms)
+ℹ tests 70
+ℹ suites 0
+ℹ pass 70
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 200315.3453

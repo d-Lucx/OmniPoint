@@ -47,6 +47,52 @@ function order(register: ReturnType<typeof Terminal.prototype.retail>, mode: 'se
   return id;
 }
 
+test('UI lost workflow and tender responses replay original identities after reload with one receipt', {timeout:40_000}, async t => {
+  const db = await testDatabase(); t.after(() => db.close());
+  const { f, a } = await checkFixture(t,db);
+  const server = createRegisterServer(a.register, { drawerId:randomUUID(), cashierSecret:secret });
+  const base = new URL('/',await f.listen(server)).href;
+  const browser = await chromium.launch({ channel:process.env.OMNI_BROWSER_CHANNEL ?? (process.platform === 'win32' ? 'msedge' : undefined), headless:true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  let dropAction = 'seat-table';
+  const attempts: Record<string,unknown>[] = [];
+  await page.route('**/api/register', async route => {
+    const input = route.request().postDataJSON();
+    if (['seat-table','module-tender'].includes(input.action)) attempts.push(input);
+    if (input.action === dropAction) {
+      dropAction = '';
+      await route.fetch(); // Real server commits to SQLite before its response is discarded.
+      await route.abort();
+    } else await route.continue();
+  });
+  await page.goto(base); await page.getByLabel('Cashier secret').fill(secret);
+  await page.getByRole('button',{name:'Sign in',exact:true}).click();
+  await page.getByRole('button',{name:'Workflows',exact:true}).click();
+  await page.getByRole('button',{name:'Seat guests',exact:true}).click();
+  await page.getByRole('heading',{name:'Workflow response uncertain'}).waitFor();
+  await page.reload();
+  await page.getByRole('button',{name:'Retry original workflow action'}).click();
+  await page.getByRole('button',{name:'Dispatch to kitchen'}).waitFor({state:'visible'});
+  assert.deepEqual(attempts[1],attempts[0]);
+  assert.equal(local(a.target.path,db=>db.prepare('SELECT count(*) AS n FROM module_events').get()?.n),1);
+  await page.getByRole('button',{name:'Dispatch to kitchen'}).click();
+  await page.getByRole('button',{name:'Freeze checks'}).click();
+  dropAction = 'module-tender';
+  await page.getByRole('button',{name:'Tender check 1'}).click();
+  await page.getByRole('heading',{name:'Workflow response uncertain'}).waitFor();
+  const original = events(a.target.path);
+  assert.equal(original.length,1);
+  await page.reload();
+  await page.getByRole('button',{name:'Retry original workflow action'}).click();
+  await page.getByRole('heading',{name:'Saved workflow receipt'}).waitFor();
+  const tenders = attempts.filter(item=>item.action === 'module-tender');
+  assert.deepEqual(tenders[1],tenders[0]);
+  assert.equal(events(a.target.path).length,1);
+  assert.deepEqual(bytes(events(a.target.path)[0]),bytes(original[0]));
+  assert.equal(local(a.target.path,db=>db.prepare('SELECT count(*) AS n FROM retail_receipts').get()?.n),1);
+});
+
 test('M5-01 browser offline check splits, exact vouchers, quota and tip replay across capability change', {timeout:40_000}, async t => {
   const db = await testDatabase();
   t.after(() => db.close());
@@ -79,25 +125,26 @@ test('M5-01 browser offline check splits, exact vouchers, quota and tip replay a
   await display.getByText('Seat 1 · toast · butter · QUEUED').waitFor();
   a.register.installCatalog({...odd,version:3,variants:catalog.variants},f.positions);
   await page.getByRole('button',{name:'Freeze checks'}).click();
-  await page.getByText('106¢ gross · 5¢ tax · 106¢ due').waitFor();
-  await page.getByText('105¢ gross · 5¢ tax · 105¢ due').waitFor();
-  await page.getByLabel('Cash payment in cents').first().fill('100');
-  await page.getByLabel('Tip in cents').first().fill('5');
+  await page.getByText('$1.06 gross · $0.05 tax · $1.06 due').waitFor();
+  await page.getByText('$1.05 gross · $0.05 tax · $1.05 due').waitFor();
+  await page.getByLabel('Cash payment (USD)').first().fill('1.00');
+  await page.getByLabel('Tip (USD)').first().fill('0.05');
   await page.getByRole('button',{name:'Tender check 1'}).click();
-  await page.getByText('106¢ gross · 5¢ tax · 6¢ due').waitFor();
+  await page.getByText('$1.06 gross · $0.05 tax · $0.06 due').waitFor();
   const aggregate = a.register.modules.state().order!.id;
   assert.throws(() => a.register.moduleTender({id:randomUUID(),aggregate,revision:3,check:0,before:0,paid:6,tip:0}),/Stale check/);
   await page.getByRole('button',{name:'Tender check 1'}).click();
-  await page.getByText('106¢ gross · 5¢ tax · 0¢ due').waitFor();
+  await page.getByText('$1.06 gross · $0.05 tax · $0.00 due').waitFor();
   await page.getByRole('button',{name:'Tender check 2'}).click();
-  await page.getByText('105¢ gross · 5¢ tax · 0¢ due').waitFor();
+  await page.getByText('$1.05 gross · $0.05 tax · $0.00 due').waitFor();
   await page.reload();
   await page.getByRole('button',{name:'Workflows'}).click();
   await page.getByRole('button',{name:'Recover check receipt 1'}).click();
   const saleRows = events(a.target.path);
   assert.equal(saleRows.length,3);
   const first = parseModuleSale(bytes(saleRows[0]));
-  await page.getByRole('heading',{name:'Receipt '+first.sale.receiptId}).waitFor();
+  await page.getByRole('heading',{name:'Saved workflow receipt'}).waitFor();
+  assert.equal(await page.getByLabel('Workflow printable receipt').textContent(), a.register.receipt(first.sale.receiptId)?.printable);
   assert.deepEqual(saleRows.map(row => {
     const sale = parseModuleSale(bytes(row));
     return [sale.paid,sale.sale.taxMinor,sale.claims.length];
@@ -182,9 +229,10 @@ test('M5-02 approved service revisions, mixed invoice, restart and one commissio
   await page.getByLabel('Cashier secret').fill(secret);
   await page.getByRole('button',{name:'Sign in'}).click();
   await page.getByRole('button',{name:'Workflows'}).click();
-  await page.getByText('Work order INVOICED',{exact:true}).waitFor();
+  await page.getByText('Work order invoiced',{exact:true}).waitFor();
   await page.getByRole('button',{name:'Recover invoice receipt'}).click();
-  await page.getByRole('heading',{name:'Receipt '+original.receiptId}).waitFor();
+  await page.getByRole('heading',{name:'Saved workflow receipt'}).waitFor();
+  assert.equal(await page.getByLabel('Workflow printable receipt').textContent(), original.printable);
 });
 
 test('M5-05 restores paired cuts, exact voucher and captured hold, quarantines and refuses a gap', {timeout:45_000}, async t => {

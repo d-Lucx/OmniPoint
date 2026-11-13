@@ -2,6 +2,14 @@
 
 OmniPoint completes a single-terminal cash sale offline and synchronizes it after a crash and a lost cloud response. Milestone 2 extends that path to two terminals with signed offline quotas and durable inventory arbitration. Milestone 3 adds the retail register, blind shifts, receipt-linked cash returns and custody-aware recount.
 
+## Staff and design guides
+
+- [Working-tree UI refinement](docs/UI_REFINEMENT.md): focused composition improvements, reproduced UI defects, comparable populated screenshots and fresh verification.
+
+- [User manual](docs/USER_MANUAL.md): daily tasks, recovery, supervisor procedures, and operator-led management and finance workflows.
+- [UI delivery audit](docs/UI_UX_AUDIT.md), [validation and screenshots](docs/UI_UX_VALIDATION.md), and [operational design system](design-system/omnipoint/MASTER.md).
+- [UI/UX overhaul prompt](docs/UI_UX_OVERHAUL_PROMPT.md): implementation handoff using UI/UX Pro Max and taste-skill, with preserved recovery and accounting contracts.
+
 ## Run the integration suite
 
 Use Node **24.22.1**, npm, and a disposable PostgreSQL **17.11** instance. Node supplies the SQLite driver and test runner. From the checkout, run `npm ci --ignore-scripts`, `npm run check`, and `npx playwright install --with-deps chromium` for Linux browser dependencies. Windows fixtures use installed Edge. In Windows PowerShell use `npm.cmd` if script execution policy blocks `npm.ps1`.

@@ -17,6 +17,7 @@ import type { TestDatabase } from './fixture.ts';
 import { catalog, grants, pin, post, removeRetailCloudFixture, removeRetailLocalFixture,
   retailFixture, retailUrl, saved, secret, stop } from './retail-fixture.ts';
 import { createCloud } from '../src/cloud.ts';
+import { createRegisterServer } from '../src/register-server.ts';
 
 let db: TestDatabase;
 before(async () => { db = await testDatabase(); });
@@ -27,11 +28,12 @@ type Fixture = Awaited<ReturnType<typeof retailFixture>>;
 async function login(page: Page) {
   await page.getByLabel('Cashier secret').fill(secret);
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await page.getByRole('heading', { name: 'Cash shift' }).waitFor();
+  await page.getByRole('navigation', { name: 'Register navigation' }).waitFor();
 }
 
 async function notice(page: Page, text: string) {
-  await page.locator('.notice').getByText(text, { exact: true }).waitFor();
+  const labels: Record<string,string> = { SYNCED: 'Cloud confirmation verified for the next event.', RETRY_WAIT: 'Cloud confirmation pending. Original event retained for retry.' };
+  await page.locator('.notice').getByText(labels[text] ?? text, { exact: true }).waitFor();
 }
 
 async function open(register: RetailRegister, opening = 5000) {
@@ -91,7 +93,7 @@ test('M3-01 browser checkout offline, forced terminal restart, dropped final vou
   await search.press('Enter');
   await page.getByText('Cart is empty').waitFor();
   await search.fill('');
-  await page.getByRole('button', { name: 'Add M1-ITEM' }).click();
+  await page.getByRole('button', { name: 'Add Blue mug' }).click();
   await page.getByRole('combobox', { name: 'Quantity for M1-ITEM' }).selectOption('0');
   await page.getByText('Cart is empty').waitFor();
   const scanner = page.getByLabel('Barcode scanner');
@@ -104,7 +106,7 @@ test('M3-01 browser checkout offline, forced terminal restart, dropped final vou
   await page.keyboard.press('Enter');
   await notice(page, 'Item added');
   await page.getByRole('combobox', { name: 'Quantity for M1-ITEM' }).waitFor();
-  await page.getByLabel('Cash tender in cents').fill('500');
+  await page.getByLabel('Cash received (USD)').fill('5.00');
   const pause = child.waitMessage();
   await page.getByRole('button', { name: 'Finalize cash sale' }).click();
   assert.equal((await pause).phase, 'after-commit');
@@ -175,6 +177,147 @@ test('M3-01 browser checkout offline, forced terminal restart, dropped final vou
   t.diagnostic(`original receipt=${event.receiptId}; sale SHA-256=${digest(checkout.bytes)}; $2.20 cash and one quota unit; ACK survived reopen`);
 });
 
+test('UI register dollars, receipt-linked return, payout close fence and blind revision persist real effects', timeout, async t => {
+  const f = await retailFixture(t, db);
+  await f.setup();
+  const terminal = f.terminal(0);
+  terminal.connection.importGrant(await f.issue('M1-ITEM', 0, 2), f.keys);
+  const server = createRegisterServer(terminal.register, { cashierSecret: secret, drawerId: randomUUID() });
+  const origin = new URL('/', await f.listen(server)).href;
+  const browser = await chromium.launch({ channel: process.env.OMNI_BROWSER_CHANNEL ?? (process.platform === 'win32' ? 'msedge' : undefined), headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 1366, height: 768 } });
+  await page.goto(origin); await login(page);
+  await page.getByRole('button', { name: 'Open shift', exact: true }).click();
+  await page.getByRole('button', { name: 'Add Blue mug', exact: true }).click();
+  await page.getByText('Authorized line discount', { exact: true }).click();
+  await page.getByLabel('Discount amount (USD)').fill('0.10');
+  await page.getByLabel('Discount reason', { exact: true }).fill('Approved damaged packaging');
+  await page.getByLabel('Supervisor PIN', { exact: true }).fill(pin);
+  await page.getByRole('button', { name: 'Apply discount' }).click();
+  await page.getByLabel('Cash received (USD)').fill('1.001');
+  await page.getByRole('button', { name: 'Finalize cash sale' }).click();
+  assert.equal(local(terminal.target.path, db => db.prepare('SELECT count(*) AS n FROM retail_receipts').get()?.n), 0);
+  await page.getByLabel('Cash received (USD)').fill('1.00');
+  await page.getByRole('button', { name: 'Finalize cash sale' }).click();
+  await page.locator('.notice.error').waitFor();
+  const originalAttempt = await page.evaluate(() => localStorage.getItem('omnipoint-pending-checkout'));
+  await page.getByRole('button', { name: 'Check original checkout', exact: true }).click();
+  await page.getByText('No saved receipt found.', { exact: false }).waitFor();
+  await page.getByLabel('Cash received (USD)').fill('5.00');
+  await page.getByText('$2.90', { exact: true }).waitFor();
+  await page.getByRole('button', { name: 'Finalize cash sale' }).dblclick();
+  await page.getByRole('heading', { name: 'Saved receipt' }).waitFor();
+  const original = await page.getByLabel('Printable receipt').textContent();
+  const persisted = saved(terminal.target.path);
+  assert.equal(persisted.event.saleId, originalAttempt);
+  assert.equal((persisted.event as RetailSale).totalMinor, 210);
+  assert.equal(local(terminal.target.path, db => db.prepare('SELECT count(*) AS n FROM retail_receipts').get()?.n), 1);
+  await page.getByRole('button', { name: 'Receipts & returns', exact: true }).click();
+  await page.getByRole('button', { name: 'Reprint original' }).click();
+  assert.equal(await page.getByLabel('Printable receipt').textContent(), original);
+  await sync(terminal.register, 2);
+  await page.getByLabel('Supervisor PIN', { exact: true }).fill(pin);
+  await page.getByRole('button', { name: 'Reserve return', exact: true }).click();
+  await page.getByRole('button', { name: 'Begin payout' }).click();
+  await page.getByRole('button', { name: 'Shift & cash', exact: true }).click();
+  await page.getByRole('heading', { name: 'Cash payout uncertain', exact: true }).waitFor();
+  assert.equal(await page.getByText('Expected $', { exact: false }).count(), 0);
+  await page.getByRole('button', { name: 'Commit blind count' }).click();
+  await page.locator('.notice.error').waitFor();
+  assert.equal(terminal.register.state().shift?.state, 'OPEN');
+  await page.getByRole('button', { name: 'Review return payout' }).click();
+  await page.getByLabel('Supervisor PIN', { exact: true }).nth(1).fill(pin);
+  await page.getByRole('button', { name: 'Confirm cash paid' }).click();
+  await page.getByRole('button', { name: 'Shift & cash', exact: true }).click();
+  await page.getByLabel('$50.00 count', { exact: true }).fill('1');
+  await page.getByRole('button', { name: 'Commit blind count' }).click();
+  await page.getByText('Counted $50.00 · Expected $50.00 · Variance $0.00', { exact: true }).waitFor();
+  assert.equal(terminal.register.state().close?.variance_minor, 0);
+  await page.getByLabel('$50.00 count', { exact: true }).fill('1');
+  await page.getByLabel('Revision reason').fill('Independent supervised recount');
+  await page.getByLabel('Supervisor PIN', { exact: true }).fill(pin);
+  await page.getByRole('button', { name: 'Submit revised count' }).click();
+  assert.equal(terminal.register.state().close?.delta_minor, 0);
+  for (const width of [390, 768, 1280]) {
+    await page.setViewportSize({ width, height: 768 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+  }
+  assert.deepEqual(saved(terminal.target.path, persisted.event.saleId).bytes, persisted.bytes);
+});
+
+test('UI long product names, maximum quantity and reduced motion reflow at register and narrow sizes', timeout, async t => {
+  const f = await retailFixture(t, db, [8,8,8]); await f.setup();
+  const terminal = f.terminal(0);
+  terminal.connection.importGrant(await f.issue('M1-ITEM',0,8),f.keys);
+  const label = 'Blue ceramic travel mug with reusable lid and presentation gift packaging';
+  terminal.register.installCatalog({ ...catalog, version:2, variants:catalog.variants.map(item => item.sku === 'M1-ITEM' ? { ...item, label } : item) },f.positions);
+  const server = createRegisterServer(terminal.register,{cashierSecret:secret,drawerId:randomUUID()});
+  const base = new URL('/',await f.listen(server)).href;
+  const browser = await chromium.launch({channel:process.env.OMNI_BROWSER_CHANNEL ?? (process.platform === 'win32' ? 'msedge' : undefined),headless:true});
+  t.after(()=>browser.close());
+  const page = await browser.newPage(); await page.emulateMedia({reducedMotion:'reduce'});
+  await page.goto(base); await login(page);
+  await page.getByRole('button',{name:'Open shift',exact:true}).click();
+  await page.getByLabel('Barcode scanner').fill('210001'); await page.getByLabel('Barcode scanner').press('Enter');
+  await notice(page,'Item added');
+  assert.equal(await page.getByLabel('Barcode scanner').evaluate(el=>document.activeElement === el),true);
+  await page.getByLabel('Quantity for M1-ITEM').selectOption('8');
+  await page.getByText('$17.64',{exact:true}).first().waitFor();
+  await page.getByLabel('Cash received (USD)').fill('1000000.00');
+  for (const width of [1366,1280,768,390,320]) {
+    await page.setViewportSize({width,height:768});
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth),false,`${width}px overflow`);
+    assert.equal(await page.getByRole('button',{name:'Finalize cash sale',exact:true}).isEnabled(),true);
+  }
+  assert.equal(await page.evaluate(()=>matchMedia('(prefers-reduced-motion: reduce)').matches),true);
+  assert.equal(await page.getByLabel('Cash received (USD)').evaluate(el=>getComputedStyle(el).animationName),'none');
+});
+
+test('UI in-page navigation preserves workflow draft and payment context without submitting a sale', timeout, async t => {
+  const f = await retailFixture(t,db); await f.setup();
+  await db.fixture.query('INSERT INTO omni.capability_profiles VALUES($1,1,true,true,true)',[f.a.tenantId]);
+  const terminal = f.terminal(0); await terminal.register.modules.refresh();
+  terminal.connection.importGrant(await f.issue('M1-ITEM',0,2),f.keys);
+  const server = createRegisterServer(terminal.register,{cashierSecret:secret,drawerId:randomUUID()});
+  const base = new URL('/',await f.listen(server)).href;
+  const browser = await chromium.launch({channel:process.env.OMNI_BROWSER_CHANNEL ?? (process.platform === 'win32' ? 'msedge' : undefined),headless:true});
+  t.after(()=>browser.close());
+  const page = await browser.newPage({viewport:{width:1366,height:768}}); await page.goto(base); await login(page);
+  await page.getByRole('button',{name:'Open shift',exact:true}).click();
+  await page.getByLabel('Barcode scanner').fill('210001'); await page.getByLabel('Barcode scanner').press('Enter');
+  await notice(page,'Item added');
+  await page.getByLabel('Catalog search').fill('mug');
+  await page.getByLabel('Cash received (USD)').fill('5.00');
+  await page.getByRole('button',{name:'Workflows',exact:true}).click();
+  await page.getByLabel('Start (UTC)').fill('2026-12-02T10:00');
+  await page.getByRole('link',{name:'Skip to content',exact:true}).press('Enter');
+  await page.waitForURL('**/#main');
+  assert.equal(await page.getByRole('button',{name:'Workflows',exact:true}).getAttribute('aria-current'),'page');
+  assert.equal(await page.getByLabel('Start (UTC)').inputValue(),'2026-12-02T10:00');
+  await page.getByRole('button',{name:'Register',exact:true}).click();
+  assert.equal(await page.getByLabel('Cash received (USD)').inputValue(),'5.00');
+  assert.equal(await page.getByLabel('Catalog search').inputValue(),'mug');
+  await page.getByRole('link',{name:'Go to payment',exact:false}).click();
+  assert.equal(await page.locator('#payment').evaluate(el=>document.activeElement===el),true);
+  assert.equal(terminal.register.state().cart.length,1);
+  assert.equal(local(terminal.target.path,db=>db.prepare('SELECT count(*) AS n FROM retail_receipts').get()?.n),0);
+  await page.getByRole('button',{name:'Finalize cash sale',exact:true}).click();
+  await page.getByRole('heading',{name:'Saved receipt',exact:true}).waitFor();
+  assert.equal((saved(terminal.target.path).event as RetailSale).totalMinor,220);
+  await page.getByRole('button',{name:'Workflows',exact:true}).click();
+  await page.getByRole('button',{name:'Seat guests',exact:true}).click();
+  await page.getByRole('button',{name:'Dispatch to kitchen',exact:true}).click();
+  await page.getByRole('button',{name:'Freeze checks',exact:true}).click();
+  await page.getByRole('button',{name:'Tender check 1',exact:true}).click();
+  await page.getByRole('heading',{name:'Saved workflow receipt',exact:true}).waitFor();
+  assert.equal(terminal.register.state().pendingCount,3);
+  const receiptCount = local(terminal.target.path,db=>db.prepare('SELECT count(*) AS n FROM retail_receipts').get()?.n);
+  await page.getByRole('button',{name:'Diagnostics',exact:true}).click();
+  await page.getByText('3 awaiting sync',{exact:true}).waitFor({timeout:3000});
+  assert.equal(local(terminal.target.path,db=>db.prepare('SELECT count(*) AS n FROM retail_receipts').get()?.n),receiptCount);
+});
+
 test('M3-02 immutable cart quote, half-even tax, discount and mixed durable line outcomes', timeout, async t => {
   const f = await retailFixture(t, db, [1, 3, 3]);
   await f.setup();
@@ -231,6 +374,19 @@ test('M3-02 immutable cart quote, half-even tax, discount and mixed durable line
   assert.deepEqual(await Promise.all(catalog.variants.map(item => stock(f, item.sku))), before);
   const { rows } = await db.fixture.query('SELECT line_id,quantity FROM omni.retail_shortfalls WHERE tenant_id=$1', [f.a.tenantId]);
   assert.deepEqual(rows, [{ line_id: sale.event.lines[0].id, quantity: 1 }]);
+  const server = createRegisterServer(b.register,{cashierSecret:secret,drawerId:randomUUID()});
+  const base = new URL('/',await f.listen(server)).href;
+  const browser = await chromium.launch({channel:process.env.OMNI_BROWSER_CHANNEL ?? (process.platform === 'win32' ? 'msedge' : undefined),headless:true});
+  t.after(()=>browser.close());
+  const page = await browser.newPage(); await page.goto(base); await login(page);
+  await page.getByRole('button',{name:'Receipts & returns',exact:true}).click();
+  await page.getByLabel('Receipt or checkout request ID', {exact:true}).fill(receipt.receiptId);
+  await page.getByRole('button',{name:'Find receipt',exact:true}).click();
+  await page.locator('.receipt-facts').getByText('Cloud confirmed',{exact:true}).waitFor();
+  await page.locator('.receipt-facts').getByText('1 backordered',{exact:true}).waitFor();
+  await page.getByText('Line 1: fulfilled 0 · backordered 1',{exact:true}).waitFor();
+  assert.equal(await page.getByLabel('Printable receipt').textContent(),receipt.printable);
+  assert.deepEqual(saved(b.target.path,receipt.eventId).bytes,sale.bytes);
 });
 
 function returnInput(receiptId: string, lineId: string) {

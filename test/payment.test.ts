@@ -60,7 +60,7 @@ test(
     const login = async () => {
       await page.getByLabel('Cashier secret').fill(secret);
       await page.getByRole('button', { name: 'Sign in' }).click();
-      await page.getByRole('heading', { name: 'Cash shift' }).waitFor();
+      await page.getByRole('navigation', { name: 'Register navigation' }).waitFor();
     };
     await page.goto(origin);
     await login();
@@ -110,9 +110,10 @@ test(
     await restarted.send({ ...f.serve(), port });
     await page.reload();
     await login();
-    await page.getByText('MAY_HAVE_SENT', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Receipts & returns', exact: true }).click();
+    await page.getByText('Payment outcome uncertain', { exact: true }).waitFor();
     await page.getByRole('button', { name: 'Check payment', exact: true }).click();
-    await page.getByText('FINALIZED', { exact: true }).first().waitFor();
+    await page.getByText('Receipt finalized', { exact: true }).first().waitFor();
     const stored = f.cardBytes(id!);
     const parsed = parseCard(stored.bytes);
     assert.equal(parsed.sale.totalMinor, 220);
@@ -121,7 +122,7 @@ test(
     assert.match(printable ?? '', /Fiscal FixtureSeries\/1/);
     const sync = async (status: string) => {
       await page.getByRole('button', { name: 'Sync next' }).click();
-      await page.locator('.notice').getByText(status, { exact: true }).waitFor();
+      await page.locator('.notice').getByText(status === 'SYNCED' ? 'Cloud confirmation verified for the next event.' : 'Cloud confirmation pending. Original event retained for retry.', { exact: true }).waitFor();
     };
     await sync('SYNCED');
     await sync('RETRY_WAIT');

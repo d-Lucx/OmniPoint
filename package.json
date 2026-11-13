@@ -8,7 +8,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "npm run build:register && node --test --test-concurrency=1 test/milestone.test.ts test/quota.test.ts test/retail.test.ts test/payment.test.ts test/modules.test.ts test/module-completion.test.ts test/governance.test.ts test/treasury.test.ts test/release-cli.test.ts",
+    "test": "npm run build:register && node --test --test-concurrency=1 test/milestone.test.ts test/quota.test.ts test/retail.test.ts test/payment.test.ts test/modules.test.ts test/module-completion.test.ts test/governance.test.ts test/treasury.test.ts test/release-cli.test.ts test/ui-money.test.ts test/ui-recovery.test.ts",
     "test:storage": "node --test test/storage-filesystem.test.ts",
     "demo:m2": "node --test --test-name-pattern=M2-01 --test-name-pattern=M2-05 test/quota.test.ts",
     "terminal": "node src/terminal-cli.ts",
